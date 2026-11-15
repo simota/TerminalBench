@@ -1,4 +1,4 @@
 metric: cmd.overhead
 unit: us
-description: "Command dispatch overhead: shell spawn + builtin `true` exec + exit"
+description: "Wall-clock time of `{shell} -c true`: process spawn + shell initialization + builtin `true` + exit. Not a differential against a direct exec."
 command: "{shell} -c true"

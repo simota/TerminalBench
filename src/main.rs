@@ -3,12 +3,16 @@
 //! output conventions match the zsh/python implementation it replaces;
 //! docs/reporting-spec-v1.md remains the wire contract.
 
+mod aa;
+mod cleanup;
 mod compare;
 mod fidelity;
 mod fire;
+mod linuxhost;
 mod lock;
 mod measure;
 mod orchestrate;
+mod procfs;
 mod report;
 mod resource;
 mod runner;
@@ -28,12 +32,15 @@ fn usage() -> &'static str {
 
 Usage:
   tbench run [--scenario NAME] [--shells zsh,bash] [--runs N] [--app NAME]
-             [--output PATH]
+             [--strict] [--output PATH]
   tbench list
   tbench show [FILE]
   tbench compare FILE FILE [FILE ...] [--format markdown|html] [--output PATH] [--baseline NAME]
   tbench compare BASELINE.json LATEST.json --threshold 10%
-  tbench trend [FILE ...] [--format markdown|html] [--output PATH]
+  tbench compare --threshold 10% BASELINE.json ... --latest LATEST.json ...
+  tbench trend [FILE ...] [--format markdown|html] [--output PATH] [--noise PCT]
+  tbench aa [--repeats N] [--scenario NAME] [--runs N] [--thresholds LIST]
+  tbench aa --from FILE FILE [FILE ...] [--thresholds LIST]
   tbench orchestrate --apps Ghostty,iTerm,Terminal [--scenario NAME] [--runs N]
                       [--format markdown|html] [--output-dir PATH] [--timeout N]
   tbench -h | --help
@@ -49,15 +56,18 @@ Options (run):
                     scroll.proxy; other scenarios fall back to a fixed default)
   --settle N        Seconds to pause between scenarios/variants (default: 2);
                     resource.*'s idle sampling always waits at least 5s
-                    regardless, to let macOS's decayed %cpu average cool down
-  --warmup N        Discarded warmup trials for process-timed and PTY-echo
-                    metrics (default: 3; not used by resource.* or fire.fps)
+                    regardless, so earlier load has died down
+  --warmup N        Discarded warmup trials for process-timed metrics
+                    (default: 3; not used by resource.* or fire.fps)
   --keep-samples    Attach each result's raw per-trial samples as a
                     "samples" array in the JSON (default: off); needed for
                     `compare`'s significance testing and bootstrap CI
   --force           Skip the other-tbench-run check/wait instead of waiting
                     up to 120s — results may be polluted by cross-run
                     interference if one really is running
+  --strict          Exit 1 (after writing the report) if any scenario produced
+                    no results; by default skipped scenarios are only listed
+                    on stderr
   --app NAME        Record NAME as the report's terminal/app identity instead
                     of detecting it from TERM_PROGRAM; wins over the
                     TBENCH_TERMINAL_ID environment override. Must be a
@@ -80,11 +90,21 @@ Options (compare):
                     self-contained chart report, always written to a file:
                     --output if given, else results/compare-<timestamp>.html)
   --output PATH     Write the report to PATH (in addition to stdout for markdown)
-  --threshold PCT    Regression-detection mode: requires exactly 2 files
-                     (baseline, latest); exits non-zero if any metric
-                     regressed by more than PCT (e.g. "10%") AND (when both
-                     files have --keep-samples data for that metric)
-                     Mann-Whitney p<0.05
+  --threshold PCT   Regression gate: exits 3 if any metric got worse by more
+                    than PCT (e.g. "10%"). Takes 2 files (baseline, latest),
+                    or groups of repeated runs separated by --latest
+  --latest          With --threshold: files before it are baseline runs,
+                    files after it are latest runs. Each metric is compared
+                    on the median of its per-run medians. With at least 4
+                    runs on each side a flagged metric fails only if a
+                    Mann-Whitney U test across the run medians gives p<0.05;
+                    with fewer runs (including the 2-file form) there is no
+                    significance test and the threshold alone decides
+  --threshold-points N
+                    With --threshold: absolute rule for percentage-unit
+                    metrics whose baseline median is 0 (idle resource.cpu):
+                    fail when the latest median is more than N points above
+                    it (default: 5, minimum: 1)
   --baseline NAME   HTML only: which entity the Overview chart's delta bars
                     compare against (a terminal name or an input file/path);
                     default is the first file
@@ -95,6 +115,28 @@ Options (trend):
   --format FORMAT   "markdown" (default) or "html" (line-chart report,
                     written to --output or results/trend-<timestamp>.html)
   --output PATH     Write the report to PATH (in addition to stdout for markdown)
+  --noise PCT       Markdown: a change is called better or worse only beyond
+                    this band (default: 5%); smaller ones are marked "within
+                    noise". Percentage-unit rows use 1 point. `tbench aa`
+                    shows what a setup needs
+
+Options (aa) — A/A self-check of the regression gate:
+  Runs one configuration several times and reports how far identical runs
+  drift apart and how often the gate would fail one half of them against
+  the other. Every such failure is noise, so this shows which --threshold
+  the machine supports.
+  --repeats N       Runs to take (default: 8, the fewest that give the gate
+                    4 runs per side for its significance test)
+  --scenario NAME, --shells LIST, --runs N, --settle N, --warmup N
+                    Passed through to each `tbench run`
+  --from FILE ...   Analyse existing reports of one configuration instead
+                    of running
+  --thresholds LIST Comma-separated percentages to evaluate (default:
+                    0,2,5,10)
+  --min-points N    Point floor for percentage-unit rows, to see what the
+                    gate's fixed 1-point floor does (default: 1)
+  --output-dir PATH Where the run reports go (default: results/aa-<timestamp>/)
+  --output PATH     Also write the Markdown report to PATH
 
 Options (orchestrate) — macOS only:
   --apps LIST       Comma-separated app names to run in sequence, one fresh
@@ -109,17 +151,18 @@ Options (orchestrate) — macOS only:
 Metrics:
   shell-scoped:      shell.startup, cmd.overhead
   terminal-scoped:   render.throughput (plain/ansi/cjk variants),
-                     scroll.proxy, input.latency (idle/loaded variants),
+                     scroll.proxy,
                      resource.mem, resource.cpu (idle/load variants),
                      fire.fps (duration-based, see scenarios/fire.yaml)
                      (approximate/proxy — see README.md)
 
-Backend: built-in monotonic timer ("rust-timer"); input.latency uses a
-native pty round trip ("rust-pty"). See docs/benchmark-metrics.md.
+Backend: built-in monotonic timer ("rust-timer"). See
+docs/benchmark-metrics.md.
 "#
 }
 
-/// Repo root: the directory holding scenarios/. Resolved from the binary's
+/// Working root: where results/ lives and where a scenarios/ directory, if
+/// present, overrides the bundled scenarios. Resolved from the binary's
 /// location (target/*/tbench or an installed copy next to scenarios/),
 /// falling back to the current directory.
 fn root_dir() -> PathBuf {
@@ -161,26 +204,31 @@ fn main() -> ExitCode {
         Some("show") => cmd_show(&args[1..]),
         Some("compare") => compare::cmd_compare(&args[1..], &root_dir()),
         Some("trend") => trend::cmd_trend(&args[1..], &root_dir()),
+        Some("aa") => aa::cmd_aa(&args[1..], &root_dir()),
         Some("orchestrate") => orchestrate::cmd_orchestrate(&args[1..], &root_dir()),
         Some("validate") => validate::cmd_validate(&args[1..], &root_dir()),
         Some("__smoke-report") => {
             // Hidden test hook: emit a synthetic report covering every
             // registered profile through the real assembly path.
-            let doc =
-                report::build_report(&report::smoke_rows(), fidelity::probe_sync_output(), None);
+            let doc = report::build_report(
+                &report::smoke_rows(),
+                fidelity::probe_sync_output(),
+                None,
+                Default::default(),
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&doc).expect("report serialization")
             );
             ExitCode::SUCCESS
         }
-        Some("__flood") => {
-            // Internal: background output flood for loaded/load variants.
-            match args.get(1) {
-                Some(f) => measure::flood_main(Path::new(f)),
-                None => ExitCode::from(2),
-            }
-        }
+        // Internal: background output flood for load variants.
+        Some("__flood") => measure::flood_main(),
+        // Internal: one timed write of a fixture to the tty.
+        Some("__emit") => match args.get(1) {
+            Some(variant) => measure::emit_main(variant),
+            None => ExitCode::from(2),
+        },
         Some("-h") | Some("--help") => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -204,6 +252,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut warmup: usize = 3;
     let mut keep_samples = false;
     let mut force = false;
+    let mut strict = false;
     let mut app: Option<String> = None;
     let mut output: Option<PathBuf> = None;
 
@@ -239,6 +288,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             "--keep-samples" => keep_samples = true,
             "--force" => force = true,
+            "--strict" => strict = true,
             "--app" => {
                 let v = next_val!("--app");
                 match report::trimmed_opaque_id(&v) {
@@ -263,43 +313,43 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return die_usage("tbench: --runs must be a positive integer or \"auto\"");
     };
 
+    cleanup::install();
     let lockfile = root.join("results/.tbench.lock");
     let _lock = match lock::acquire(&lockfile, force) {
         Ok(l) => l,
         Err(e) => return die(&e, 1),
     };
 
+    let all = match scenario::load_all(&root) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            return die(
+                &format!(
+                    "tbench: no scenarios found in {}/scenarios/",
+                    root.display()
+                ),
+                1,
+            )
+        }
+        Err(e) => return die(&format!("tbench: failed to list scenarios: {e}"), 1),
+    };
     let scenarios = match scenario_name {
         Some(name) => {
-            let f = root.join(format!("scenarios/{name}.yaml"));
-            if !f.is_file() {
-                return die_usage(&format!(
-                    "tbench: unknown scenario '{name}' (expected {})",
-                    f.display()
-                ));
-            }
-            match scenario::Scenario::load(&f) {
-                Ok(s) => vec![s],
-                Err(e) => return die(&format!("tbench: failed to load {}: {e}", f.display()), 1),
+            let names: Vec<String> = all.iter().map(|sc| sc.name.clone()).collect();
+            match all.into_iter().find(|sc| sc.name == name) {
+                Some(sc) => vec![sc],
+                None => {
+                    return die_usage(&format!(
+                        "tbench: unknown scenario '{name}' (available: {})",
+                        names.join(", ")
+                    ))
+                }
             }
         }
-        None => match scenario::load_all(&root) {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => {
-                return die(
-                    &format!(
-                        "tbench: no scenarios found in {}/scenarios/",
-                        root.display()
-                    ),
-                    1,
-                )
-            }
-            Err(e) => return die(&format!("tbench: failed to list scenarios: {e}"), 1),
-        },
+        None => all,
     };
 
     let cfg = runner::RunConfig {
-        root: root.clone(),
         shells: shells
             .split(',')
             .map(str::to_string)
@@ -309,9 +359,19 @@ fn cmd_run(args: &[String]) -> ExitCode {
         warmup,
         settle_secs: settle,
         keep_samples,
+        extensions: Default::default(),
     };
 
+    if let Some(mux) = resource::pty_intermediary() {
+        eprintln!("tbench: running inside {mux}; render.throughput, scroll.proxy and fire.fps will measure {mux}, not the terminal emulator");
+    }
+
     let mut results = Vec::new();
+    let mut skipped: Vec<&str> = Vec::new();
+    // resource.*/idle is a baseline: sample it before any scenario has
+    // pushed output through the terminal's scrollback.
+    let mut scenarios = scenarios;
+    scenarios.sort_by_key(|sc| sc.kind() != "resource_footprint");
     for (i, sc) in scenarios.iter().enumerate() {
         // Settle between scenarios too, not just between variants within
         // one — the same cross-contamination risk applies at scenario
@@ -319,7 +379,44 @@ fn cmd_run(args: &[String]) -> ExitCode {
         if i > 0 {
             runner::settle(&cfg);
         }
-        runner::run_scenario(sc, &cfg, &mut results);
+        if !runner::run_scenario(sc, &cfg, &mut results) {
+            skipped.push(&sc.name);
+        }
+    }
+    {
+        // Run parameters: enough to tell whether two reports followed the
+        // same protocol. Recorded as an extension, so it never affects
+        // conformance or the comparability gate.
+        use std::os::fd::AsRawFd;
+        let tty = std::fs::File::options()
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+            .map(|f| fire::winsize(f.as_raw_fd()))
+            .filter(|(cols, rows)| *cols > 0 && *rows > 0);
+        let ran_fire = scenarios.iter().any(|sc| sc.kind() == "fire");
+        cfg.extensions.borrow_mut().insert(
+            "org.terminalbench.run".to_string(),
+            serde_json::json!({
+                "requested_runs": runs_raw,
+                "warmup": warmup,
+                "settle_secs": settle,
+                "shells": cfg.shells,
+                "keep_samples": keep_samples,
+                "scenarios": scenarios.iter().map(|sc| sc.name.as_str()).collect::<Vec<_>>(),
+                "scenarios_without_results": skipped,
+                "fire_secs": if ran_fire { std::env::var("FIRE_SECS").ok() } else { None },
+                "tty": tty.map(|(cols, rows)| serde_json::json!({"cols": cols, "rows": rows})),
+            }),
+        );
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "tbench: {} of {} scenarios produced no results: {}",
+            skipped.len(),
+            scenarios.len(),
+            skipped.join(", ")
+        );
     }
 
     if results.is_empty() {
@@ -330,8 +427,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 
     let sync_output = fidelity::probe_sync_output();
-    let doc = report::build_report(&results, sync_output, app.as_deref());
+    let doc = report::build_report(&results, sync_output, app.as_deref(), cfg.extensions.take());
     let json = serde_json::to_string_pretty(&doc).expect("report serialization");
+    if doc["run_context"]["environment"]["display_refresh_hz"]["status"] == "unknown"
+        && results.iter().any(|row| report::is_tty_bound(&row.metric))
+    {
+        eprintln!("tbench: display refresh rate is unknown, so the comparability gate will answer UNDETERMINED for render.throughput, scroll.proxy and fire.fps. Set it for the run, e.g. TBENCH_DISPLAY_REFRESH_HZ=60");
+    }
 
     let output = output.unwrap_or_else(|| {
         root.join(format!(
@@ -355,6 +457,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // machine-readable JSON contract scripts pipe.
     eprintln!();
     eprintln!("{}", show::render(&doc));
+    if strict && !skipped.is_empty() {
+        return die(
+            "tbench: --strict: one or more scenarios produced no results",
+            1,
+        );
+    }
     ExitCode::SUCCESS
 }
 

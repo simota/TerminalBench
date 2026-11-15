@@ -7,23 +7,34 @@ on:
 
 jobs:
   check:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install zsh
+        # tests/report-v1.sh is a zsh script; the Ubuntu image has no zsh.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint
         run: make lint
-      - name: Unit tests
-        run: make unit
+      - name: Unit and integration tests
+        # Includes tests/pty_run.rs, which runs the whole suite inside a
+        # pty so tty-bound scenarios are not skipped on a runner without a
+        # terminal. --nocapture puts the rows each run produced in the log.
+        run: make unit TEST_ARGS="-- --nocapture"
       - name: Reporting Spec v1 suite
         # Explicit controls stand in for what discovery can't provide on a
         # headless runner (see README "Reporting Specification v1").
         env:
           TBENCH_TERMINAL_ID: "ci-terminal 1.0"
-          TBENCH_MACHINE_MODEL: "github-macos-runner"
+          TBENCH_MACHINE_MODEL: "github-hosted-runner"
           TBENCH_POWER_SOURCE: ac
           TBENCH_LOW_POWER_MODE: "false"
           TBENCH_DISPLAY_REFRESH_HZ: "60"

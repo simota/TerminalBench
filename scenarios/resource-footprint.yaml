@@ -3,5 +3,5 @@ mem_metric: resource.mem
 cpu_metric: resource.cpu
 unit_mem: MB
 unit_cpu: pct
-description: "RSS and %CPU of the terminal emulator process itself (not the shell), sampled idle and while a render.throughput-style flood is running."
-notes: "Measures the emulator's own GUI process, identified by walking the process ancestry to the first .app-bundle executable. Not measurable inside tmux/SSH/non-macOS — skipped with a warning there. macOS %cpu is a decayed running average, not an instant sample; the reported value is a median of several samples."
+description: "RSS and CPU use of the terminal emulator process itself (not the shell), sampled idle and while a render.throughput-style flood is running."
+notes: "macOS: measures the emulator's own GUI process, identified by walking the process ancestry to the first .app-bundle executable; %cpu is the decayed running average ps reports, not an instant sample. Linux: see the per-result note. Not measurable inside tmux, screen or SSH — skipped with a warning there."

@@ -1,5 +1,5 @@
-//! Reporting Specification v1 document assembly — port of lib/report.sh.
-//! The wire format is the migration's fixed contract: schemas/
+//! Reporting Specification v1 document assembly.
+//! The wire format is a fixed contract: schemas/
 //! tbench-report-v1.schema.json plus the semantic rules in
 //! docs/reporting-spec-v1.md remain authoritative, and bin/tbench-validate
 //! must accept every report this module emits.
@@ -33,183 +33,46 @@ fn round_to(v: f64, decimals: i32) -> f64 {
     (v * f).round() / f
 }
 
-/// Proxy notes are closed profile data in Reporting Spec v1: caller prose
-/// is deliberately replaced so synonyms cannot broaden a proxy claim.
-pub fn proxy_safe_note(metric: &str, variant: Option<&str>) -> Option<&'static str> {
-    match (metric, variant) {
-        ("render.throughput", _) => Some(
-            "Proxy only: measures producer-side PTY write completion; it does not observe terminal parsing, final-frame presentation, frame time, FPS, pixels presented, or complete rendering.",
-        ),
-        ("scroll.proxy", _) => Some(
-            "Proxy only: measures producer-side PTY write completion for the scroll workload; it does not observe scroll, redraw, display events, frame time, FPS, pixels presented, or complete rendering.",
-        ),
-        ("input.latency", _) => Some(
-            "Proxy only: measures a synthetic PTY echo round trip; it does not observe physical keypress, GUI input latency, screen response, keypress-to-display, or keypress-to-photon latency.",
-        ),
-        ("fire.fps", Some(_)) => Some(
-            "Proxy only: measures producer-completed frames for a truecolor repaint stream at the cell geometry recorded by variant; throughput includes overlapped frame composition and PTY writing and does not observe terminal parsing, compositing, or confirmed on-screen frame presentation, so this fps is not a measured render frame rate.",
-        ),
-        ("fire.fps", None) => Some(
-            "Proxy only: measures producer-side PTY write completion for a live window-sized truecolor repaint stream; it does not observe terminal parsing, compositing, or confirmed on-screen frame presentation, so this fps is a producer-side drain-rate proxy, not a measured render frame rate, and it scales inversely with window cell count so values are only comparable at matching window geometry.",
-        ),
-        _ => None,
-    }
-}
-
-struct Profile {
-    profile: &'static str,
-    classification: &'static str,
-    method: &'static str,
-    scope: &'static str,
-    boundary: &'static str,
-    direction: &'static str,
-    limitation: &'static str,
-    excluded: &'static str,
-    workload_prefix: &'static str, // variant appended when it contains "{variant}"
-}
-
-fn profile_for(metric: &str, unit: &str, variant: Option<&str>) -> Profile {
-    match (metric, unit, variant) {
-        ("shell.startup", "ms", _) => Profile {
-            profile: "org.terminalbench.shell.startup",
-            classification: "sampled",
-            method: "org.terminalbench.method.process-wall-clock",
-            scope: "shell-process-startup",
-            boundary: "process-invocation-to-process-exit",
-            direction: "lower-is-better",
-            limitation: "Includes shell startup configuration and process scheduling; it does not isolate terminal rendering.",
-            excluded: "Terminal rendering latency",
-            workload_prefix: "urn:tbench:workload:shell-startup:v1",
-        },
-        ("cmd.overhead", "us", _) => Profile {
-            profile: "org.terminalbench.command.overhead",
-            classification: "sampled",
-            method: "org.terminalbench.method.process-wall-clock",
-            scope: "shell-command-process",
-            boundary: "process-invocation-through-command-exit",
-            direction: "lower-is-better",
-            limitation: "Includes process spawn and shell initialization in addition to builtin dispatch.",
-            excluded: "In-process command dispatch latency",
-            workload_prefix: "urn:tbench:workload:command-overhead:v1",
-        },
-        ("render.throughput", "MBps", _) => Profile {
-            profile: "org.terminalbench.render.throughput.bytes",
-            classification: "proxy",
-            method: "org.terminalbench.method.pty-write-wall-clock",
-            scope: "pty-output-pipeline",
-            boundary: "fixture-write-start-to-producer-exit",
-            direction: "higher-is-better",
-            limitation: "Measures producer-side PTY write completion; terminal parsing, final-frame presentation, and frame skipping are not observed.",
-            excluded: "On-screen rendering throughput",
-            workload_prefix: "urn:tbench:workload:render-{variant}:v1",
-        },
-        ("render.throughput", "linesps", _) => Profile {
-            profile: "org.terminalbench.render.throughput.lines",
-            classification: "proxy",
-            method: "org.terminalbench.method.pty-write-wall-clock",
-            scope: "pty-output-pipeline",
-            boundary: "fixture-write-start-to-producer-exit",
-            direction: "higher-is-better",
-            limitation: "Measures producer-side PTY write completion; terminal parsing, final-frame presentation, and frame skipping are not observed.",
-            excluded: "On-screen rendering throughput",
-            workload_prefix: "urn:tbench:workload:render-{variant}:v1",
-        },
-        ("scroll.proxy", "ms", _) => Profile {
-            profile: "org.terminalbench.scroll.proxy",
-            classification: "proxy",
-            method: "org.terminalbench.method.pty-write-wall-clock",
-            scope: "pty-output-and-scrollback-proxy",
-            boundary: "fixture-write-start-to-producer-exit",
-            direction: "lower-is-better",
-            limitation: "No scroll, redraw, frame-presentation, or display event is observed.",
-            excluded: "On-screen scroll latency",
-            workload_prefix: "urn:tbench:workload:scroll-proxy:v1",
-        },
-        ("input.latency", "ms", _) => Profile {
-            profile: "org.terminalbench.input.pty-round-trip",
-            classification: "proxy",
-            method: "org.terminalbench.method.zpty-echo-round-trip",
-            scope: "pseudo-terminal-echo",
-            boundary: "byte-write-to-pty-echo-read",
-            direction: "lower-is-better",
-            limitation: "Uses a synthetic PTY echo and excludes physical input devices, GUI event routing, rendering, and display presentation.",
-            excluded: "Physical-keypress-to-photon latency",
-            workload_prefix: "urn:tbench:workload:input-{variant}:v1",
-        },
-        ("resource.mem", "MB", _) => Profile {
-            profile: "org.terminalbench.resource.memory",
-            classification: "sampled",
-            method: "org.terminalbench.method.process-sample",
-            scope: "terminal-process-resident-memory",
-            boundary: "identified-terminal-process-rss-sample",
-            direction: "lower-is-better",
-            limitation: "Samples one identified process and may omit helper-process or shared-memory costs.",
-            excluded: "Whole-system memory cost",
-            workload_prefix: "urn:tbench:workload:resource-{variant}:v1",
-        },
-        ("resource.cpu", "pct", _) => Profile {
-            profile: "org.terminalbench.resource.cpu",
-            classification: "sampled",
-            method: "org.terminalbench.method.process-sample",
-            scope: "terminal-process-cpu",
-            boundary: "identified-terminal-process-cpu-sample",
-            direction: "lower-is-better",
-            limitation: "Process CPU is a sampled operating-system statistic and is not an instantaneous whole-system measurement.",
-            excluded: "Whole-system CPU cost",
-            workload_prefix: "urn:tbench:workload:resource-{variant}:v1",
-        },
-        ("fire.fps", "fps", Some(_)) => Profile {
-            profile: "org.terminalbench.fire.fps.geometry",
-            classification: "proxy",
-            method: "org.terminalbench.method.pty-write-wall-clock",
-            scope: "pty-output-pipeline",
-            boundary: "frame-write-start-to-producer-exit",
-            direction: "higher-is-better",
-            limitation: "Measures producer-side PTY write completion for a truecolor repaint stream at the cell geometry recorded by variant; terminal parsing, compositing, and confirmed on-screen frame presentation are not observed.",
-            excluded: "Confirmed on-screen frame rate",
-            workload_prefix: "urn:tbench:workload:fire-{variant}:v1",
-        },
-        ("fire.fps", "fps", None) => Profile {
-            profile: "org.terminalbench.fire.fps",
-            classification: "proxy",
-            method: "org.terminalbench.method.pty-write-wall-clock",
-            scope: "pty-output-pipeline",
-            boundary: "frame-write-start-to-producer-exit",
-            direction: "higher-is-better",
-            limitation: "Measures producer-side PTY write completion for a live window-sized truecolor repaint stream; terminal parsing, compositing, and confirmed on-screen frame presentation are not observed, and fps depends on window cell count.",
-            excluded: "Confirmed on-screen frame rate",
-            workload_prefix: "urn:tbench:workload:fire:v1",
-        },
-        _ => Profile {
-            profile: "org.terminalbench.unsupported",
-            classification: "proxy",
-            method: "org.terminalbench.method.unsupported",
-            scope: "unknown",
-            boundary: "unknown",
-            direction: "lower-is-better",
-            limitation: "No Reporting Specification v1 profile is registered for this metric and unit.",
-            excluded: "Any standardized performance claim",
-            workload_prefix: "urn:tbench:workload:unknown:v1",
-        },
-    }
-}
-
+/// The registered profile for a row, from the validator's registry (the
+/// single copy in code). A row no profile covers is emitted as
+/// "unsupported", which the validator rejects.
 fn measurement_json(row: &ResultRow) -> Value {
-    let p = profile_for(&row.metric, &row.unit, row.variant.as_deref());
-    let workload_id = if p.workload_prefix.contains("{variant}") {
-        p.workload_prefix
-            .replace("{variant}", row.variant.as_deref().unwrap_or("unknown"))
-    } else {
-        p.workload_prefix.to_string()
+    use crate::validate::Profile;
+    const UNSUPPORTED: Profile = Profile {
+        metric: "",
+        unit: "",
+        profile_id: "org.terminalbench.unsupported",
+        classification: "proxy",
+        method_id: "org.terminalbench.method.unsupported",
+        method_version: "1.0.0",
+        scope: "unknown",
+        observed_boundary: "unknown",
+        direction: "lower-is-better",
+        limitation: "No Reporting Specification v1 profile is registered for this metric and unit.",
+        excluded: "Any standardized performance claim",
+        backends: &[],
+        variants: &[],
+        shell_required: false,
+        workload: "urn:tbench:workload:unknown:v1",
     };
+    let p = crate::validate::profile_for_row(
+        &row.metric,
+        &row.unit,
+        row.variant.as_deref(),
+        &row.backend,
+    )
+    .unwrap_or(&UNSUPPORTED);
+    let workload_id = p
+        .workload
+        .replace("{variant}", row.variant.as_deref().unwrap_or("unknown"));
     json!({
-        "profile_id": p.profile,
+        "profile_id": p.profile_id,
         "profile_version": "1.0.0",
         "classification": p.classification,
-        "method_id": p.method,
-        "method_version": "1.0.0",
+        "method_id": p.method_id,
+        "method_version": p.method_version,
         "scope": p.scope,
-        "observed_boundary": p.boundary,
+        "observed_boundary": p.observed_boundary,
         "unit": row.unit,
         "direction": p.direction,
         "limitations": [p.limitation],
@@ -237,7 +100,16 @@ fn result_json(row: &ResultRow) -> Value {
     if let Some(v) = &row.variant {
         m.insert("variant".into(), json!(v));
     }
-    let effective_notes = proxy_safe_note(&row.metric, row.variant.as_deref())
+    // Proxy notes are closed profile data in Reporting Spec v1: caller
+    // prose is replaced so synonyms cannot broaden a proxy claim.
+    let profile_id = crate::validate::profile_for_row(
+        &row.metric,
+        &row.unit,
+        row.variant.as_deref(),
+        &row.backend,
+    )
+    .map(|p| p.profile_id);
+    let effective_notes = crate::validate::canonical_proxy_note(&row.metric, profile_id)
         .map(str::to_string)
         .or_else(|| row.notes.clone());
     if let Some(n) = effective_notes {
@@ -365,8 +237,13 @@ pub fn detect_terminal() -> String {
     }
 }
 
+/// Metrics whose workload is written to the controlling tty.
+pub fn is_tty_bound(metric: &str) -> bool {
+    matches!(metric, "render.throughput" | "scroll.proxy" | "fire.fps")
+}
+
 #[derive(Default)]
-struct MacosMeta {
+struct HostMeta {
     power_source: Option<String>,
     low_power_mode: Option<bool>,
     machine_model: Option<String>,
@@ -380,11 +257,42 @@ struct MacosMeta {
 /// optional, failure is omission, and the one slow call
 /// (`system_profiler SPDisplaysDataType`) is timed — gpu/refresh are
 /// dropped with a meta note if it exceeded its 1s budget.
-fn collect_macos_meta() -> MacosMeta {
-    let mut meta = MacosMeta::default();
+/// Test hook: report assembly with every discovered host fact absent, on
+/// any OS (the variable predates Linux discovery, hence its name).
+fn host_discovery_disabled() -> bool {
+    std::env::var("TBENCH_TEST_DISABLE_MACOS_META").is_ok_and(|v| v == "1")
+}
 
-    // Test hook: report assembly with every optional field absent.
-    if std::env::var("TBENCH_TEST_DISABLE_MACOS_META").is_ok_and(|v| v == "1") {
+/// Linux host facts plus the `org.terminalbench.host` extension recording
+/// what each derived fact rests on.
+fn collect_linux_meta() -> (HostMeta, Option<Value>) {
+    if host_discovery_disabled() {
+        return (HostMeta::default(), None);
+    }
+    let host =
+        crate::linuxhost::collect(std::path::Path::new("/sys"), std::path::Path::new("/proc"));
+    let extension = json!({
+        "kernel": cmd_stdout("uname", &["-r"]),
+        "session_type": std::env::var("XDG_SESSION_TYPE").ok().filter(|v| !v.is_empty()),
+        "cpu_governor": host.cpu_governor,
+        "platform_profile": host.platform_profile,
+        "power_source_basis": host.power_basis,
+        "low_power_mode_basis": host.low_power_basis,
+    });
+    let meta = HostMeta {
+        power_source: host.power_source.map(str::to_string),
+        low_power_mode: host.low_power_mode,
+        machine_model: host.machine_model,
+        cpu: host.cpu,
+        ..HostMeta::default()
+    };
+    (meta, Some(extension))
+}
+
+fn collect_macos_meta() -> HostMeta {
+    let mut meta = HostMeta::default();
+
+    if host_discovery_disabled() {
         return meta;
     }
 
@@ -470,7 +378,12 @@ fn fact_unknown(reason: &str) -> Value {
 /// probe verdict ("supported"/"unsupported"/"no_reply"). `app` is the
 /// already-validated `run --app` identifier; it wins over both detection
 /// and TBENCH_TERMINAL_ID.
-pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>) -> Value {
+pub fn build_report(
+    results: &[ResultRow],
+    sync_output: &str,
+    app: Option<&str>,
+    extensions: Map<String, Value>,
+) -> Value {
     let os = canonical_os(&cmd_stdout("uname", &["-s"]).unwrap_or_default());
     let arch = canonical_arch(&cmd_stdout("uname", &["-m"]).unwrap_or_default());
     let measured_shells: BTreeSet<&str> = results
@@ -480,7 +393,11 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
     let mut shell_versions = Vec::new();
     let mut shell_version_missing = false;
     for shell in &measured_shells {
-        match cmd_stdout(shell, &["--version"]) {
+        // First line only: bash prints its license text after the version.
+        match cmd_stdout(shell, &["--version"])
+            .and_then(|out| out.lines().next().map(|line| line.trim().to_string()))
+            .filter(|line| !line.is_empty())
+        {
             Some(version) => shell_versions.push(format!("{shell}={version}")),
             None => shell_version_missing = true,
         }
@@ -531,10 +448,39 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
         }
     }
 
-    let mut mac = if os == "darwin" {
-        collect_macos_meta()
-    } else {
-        MacosMeta::default()
+    // TERM_PROGRAM is unset in many Linux emulators. The process holding
+    // our pty master is direct evidence of which emulator this is.
+    let mut terminal_discovered = false;
+    if !terminal_override
+        && !terminal_override_invalid
+        && !std::env::var("TERM_PROGRAM").is_ok_and(|v| !v.is_empty())
+        && !host_discovery_disabled()
+    {
+        if let Some(name) = crate::resource::terminal_from_pty() {
+            terminal = name;
+            terminal_discovered = true;
+        }
+    }
+
+    if let Some(mux) = crate::resource::pty_intermediary() {
+        if results.iter().any(|row| is_tty_bound(&row.metric)) {
+            meta_notes.push(format!(
+                "run inside {mux}: render.throughput, scroll.proxy and fire.fps wrote to the {mux} pty and describe {mux}, not the terminal emulator"
+            ));
+        }
+    }
+
+    let mut extensions = extensions;
+    let mut mac = match os.as_str() {
+        "darwin" => collect_macos_meta(),
+        "linux" => {
+            let (meta, host_extension) = collect_linux_meta();
+            if let Some(ext) = host_extension {
+                extensions.insert("org.terminalbench.host".to_string(), ext);
+            }
+            meta
+        }
+        _ => HostMeta::default(),
     };
     if let Some(ms) = mac.system_profiler_over_budget_ms {
         meta_notes.push(format!(
@@ -543,7 +489,7 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
     }
 
     // Explicit env overrides (CI / non-macOS hosts) — invalid values are
-    // ignored with a meta note, never fatal, matching lib/report.sh.
+    // ignored with a meta note, never fatal.
     if let Ok(v) = std::env::var("TBENCH_MACHINE_MODEL") {
         match trimmed_opaque_id(&v) {
             Some(m) => mac.machine_model = Some(m.to_string()),
@@ -623,6 +569,7 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
 
     // run_context.environment fact objects
     let terminal_fact = if terminal_override
+        || terminal_discovered
         || (!terminal_override_invalid
             && std::env::var("TERM_PROGRAM").is_ok_and(|v| !v.is_empty()))
     {
@@ -647,7 +594,7 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
         None => fact_unknown("display refresh rate was not available"),
     };
 
-    json!({
+    let mut doc = json!({
         "$schema": "urn:tbench:schema:report:v1",
         "wire_version": "1.0.0",
         "producer": {
@@ -670,7 +617,11 @@ pub fn build_report(results: &[ResultRow], sync_output: &str, app: Option<&str>)
         },
         "meta": Value::Object(meta),
         "results": results.iter().map(result_json).collect::<Vec<_>>(),
-    })
+    });
+    if !extensions.is_empty() {
+        doc["extensions"] = Value::Object(extensions);
+    }
+    doc
 }
 
 /// UTC "YYYY-MM-DDTHH:MM:SSZ" without a chrono dependency: civil-from-days
@@ -712,9 +663,8 @@ pub fn filename_timestamp() -> String {
 
 /// Hidden `tbench __smoke-report`: one synthetic result per registered
 /// profile, driven through the real report assembly (env overrides and
-/// probes included). Exists for tests/report-v1.sh, which previously
-/// fabricated the same rows by sourcing lib/report.sh — this tests the
-/// actual additive emitter rather than a copied fixture.
+/// probes included). Exists for tests/report-v1.sh, so the suite tests the
+/// actual emitter rather than a copied fixture.
 pub fn smoke_rows() -> Vec<ResultRow> {
     let row = |metric: &str,
                unit: &str,
@@ -835,6 +785,18 @@ pub fn smoke_rows() -> Vec<ResultRow> {
             Some("idle"),
             Some("process sample"),
             &[4.0, 5.0, 7.0],
+        ),
+        row(
+            "resource.cpu",
+            "pct",
+            None,
+            "procfs",
+            40.0,
+            2.0,
+            43.0,
+            Some("load"),
+            Some("process sample"),
+            &[38.0, 40.0, 43.0],
         ),
         row(
             "fire.fps",

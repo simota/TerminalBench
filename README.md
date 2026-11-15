@@ -5,12 +5,16 @@ and terminal-emulator draw/input/resource characteristics. Implementation of
 proposal recommendation C (`docs/proposal-terminal-bench.md`), MVP scope
 plus the extension-1 emulator metrics (§3 items 1-3), the extension-2
 `compare` subcommand (§6.4/§6.6), further emulator-focused metrics
-(CJK/emoji rendering, loaded-vs-idle input latency, resource footprint),
+(CJK/emoji rendering, resource footprint),
 the measurement-quality hardening from `docs/proposal-detailed-benchmark.md`
 §A (settle, concurrent-run detection, warmup/outlier filtering, environment
 metadata, adaptive `--runs auto`), the §E `orchestrate` subcommand for
 sequential multi-emulator runs, the §C synchronized-output probe, and the
 §F statistics (`--keep-samples`, bootstrap CI, Mann-Whitney significance).
+
+Upgrading from an earlier build? Several metrics and the regression gate
+changed in ways that make old baselines incomparable:
+[`docs/upgrade-notes.md`](docs/upgrade-notes.md).
 
 ## Usage
 
@@ -62,8 +66,10 @@ bin/tbench compare results/a.json results/b.json
 
 The JSON Schema is a structural subset: passing it is necessary but is not
 sufficient for `CONFORMANT`, claim-safe, or `COMPARABLE`. The semantic rules
-and corpus in the specification remain authoritative. On CI and non-macOS
-hosts, controls that discovery cannot provide can be supplied explicitly:
+and corpus in the specification remain authoritative. Controls that
+discovery cannot provide can be supplied explicitly. On Linux that is
+normally only `TBENCH_DISPLAY_REFRESH_HZ`, which the gate needs for
+`render.throughput`, `scroll.proxy` and `fire.fps`; on CI it is all of them:
 
 ```sh
 TBENCH_TERMINAL_ID='ci-terminal 1.0' \
@@ -81,8 +87,7 @@ Real usage surfaced four ways the numbers themselves could be polluted;
 
 - **Settle between scenarios and variants** (`--settle N`, default 2s):
   `run` pauses `N` seconds between scenario files, and `render.throughput`
-  pauses between its `plain`/`ansi`/`cjk` variants and `input.latency`
-  between `idle`/`loaded`, so one variant's leftover load (a flood still
+  pauses between its `plain`/`ansi`/`cjk` variants, so one variant's leftover load (a flood still
   draining, a decaying CPU average) doesn't bleed into the next
   measurement's first samples. `resource.mem`/`resource.cpu`'s `idle`
   sampling specifically waits **at least 5s** regardless of `--settle`
@@ -101,7 +106,13 @@ Real usage surfaced four ways the numbers themselves could be polluted;
   concurrent Xcode build, Time Machine, etc.).
 - **Warmup + IQR outlier filtering**: `--warmup N` (default 3) discarded
   trials run before timing starts, and samples more than 1.5×IQR outside
-  the interquartile range are dropped before computing median/p95/stddev.
+  the interquartile range are dropped before computing median and stddev.
+  **p95 is computed from every timed trial**, filtered or not: filtering
+  first biased it about 4% low and hid slow trials that belong to the
+  workload ([`docs/p95-outlier-simulation.md`](docs/p95-outlier-simulation.md)).
+  At the default 20 trials p95 is the second-largest value and lands below
+  the true 95th percentile in about three of four runs; treat it as a tail
+  figure only from roughly 50 trials (`--runs 50`).
   The removed count is reported per result as `"outliers_removed"` (always
   present, `0` when not applicable — `resource.*` and `fire.fps`).
 - **Adaptive sampling** (`--runs auto`, for `shell.startup`/`cmd.overhead`/
@@ -110,12 +121,45 @@ Real usage surfaced four ways the numbers themselves could be polluted;
   is within 5% of the median, or 50 total trials are reached — noisier
   metrics (e.g. `cmd.overhead`, whose fork/exec cost has high relative
   variance) will often hit the 50-trial cap rather than converge early,
-  which is an expected, not a failed, outcome. `input.latency` and
-  `resource.*` don't support `auto` yet and fall back to a fixed default
+  which is an expected, not a failed, outcome. `resource.*` and
+  `fire.fps` don't support `auto` yet and fall back to a fixed default
   with a stderr note.
+- **Interrupted runs clean up**: on Ctrl-C, SIGTERM or a closed terminal,
+  `run` kills its output flood, leaves the alternate screen, restores the
+  cursor and terminal mode, removes its lock file, and exits `128 + signal`
+  without writing a report. On Linux the flood also dies if `tbench` itself
+  is killed outright.
 - **Failed-trial rejection**: non-zero child exits and commands exceeding
   the 30-second per-trial safety limit are errors, never timing samples.
-- **Environment metadata** (macOS only, best-effort — omitted, not fatal,
+- **Environment metadata on Linux** (best-effort — a fact with no sound
+  basis stays unknown):
+  - `machine_model`: DMI system vendor and product name, or the board
+    vendor and name when those are firmware placeholders, or the
+    device-tree model; followed by the CPU model, because a board alone
+    does not fix the CPU.
+  - `cpu`: the model name from `/proc/cpuinfo`.
+  - `power_source`: `ac` when a mains or USB supply is online, `battery`
+    when the system battery is discharging, `ac` when there is no system
+    battery at all. Peripheral batteries are ignored.
+  - `low_power_mode`: true when the ACPI platform profile is `low-power`,
+    false for any other profile, and false when the machine has neither a
+    profile switch nor a battery. Unknown for a battery machine without a
+    profile switch.
+  - `terminal`: when `TERM_PROGRAM` is unset, the executable name of the
+    process holding the pty master (for example `kitty`), unless that is
+    tmux, screen or another intermediary.
+  - Display refresh rate is not discovered on Linux; set
+    `TBENCH_DISPLAY_REFRESH_HZ`.
+  - `extensions["org.terminalbench.host"]` records the kernel release,
+    session type, CPU governor, platform profile, and the basis of the
+    power and low-power facts.
+- **Run parameters**: `extensions["org.terminalbench.run"]` records the
+  requested `--runs`, `--warmup`, `--settle`, `--shells`, the scenarios in
+  the order they ran, those that produced no results, `FIRE_SECS`, and the
+  terminal size in cells. Extensions never affect conformance or the
+  comparability gate; they are there so a reader can see whether two
+  reports followed the same protocol.
+- **Environment metadata on macOS** (best-effort — omitted, not fatal,
   on failure): `meta.power_source` (`pmset -g batt`), `meta.low_power_mode`,
   `meta.machine_model`/`meta.cpu` (`sysctl`), and `meta.gpu`/
   `meta.display_refresh_hz` (`system_profiler SPDisplaysDataType`, timed —
@@ -170,56 +214,96 @@ bin/tbench compare results/a.json results/b.json --output results/comparison.md
 # unless --output is given; never printed to stdout)
 bin/tbench compare results/a.json results/b.json --format html
 
-# CI regression gate: exactly 2 files (baseline, latest), exit non-zero on regression
+# Regression gate: 2 files (baseline, latest), exit 3 on regression
 bin/tbench compare results/baseline.json results/latest.json --threshold 10%
 
-# Keep raw per-trial samples (opt-in — see "Statistical rigor" below) so
-# compare can add a bootstrap CI and a significance-aware regression check
+# Regression gate over repeated runs (at least 4 per side for a significance test)
+bin/tbench compare --threshold 5% results/base-*.json --latest results/new-*.json
+
+# Keep raw per-trial samples (opt-in — see "Raw samples" below) so
+# compare can add a bootstrap CI
 bin/tbench run --keep-samples --output results/baseline.json
 ```
 
 Rows are `metric [variant] (shell) (unit)`; columns are each file's
 `meta.terminal` (disambiguated with the timestamp if two files share the
 same terminal name). Cells show the median, with the best value in a row
-**bolded** — direction-aware, since `render.throughput` is
-higher-is-better and every other metric is lower-is-better. A metric
+**bolded** (every cell sharing the best median, and none when all files
+tie) — direction-aware: `render.throughput` and `fire.fps` are
+higher-is-better, every other metric is lower-is-better (each result's
+`measurement.direction` is authoritative). A metric
 missing from a given file shows as `-` rather than dropping the row. A
 "Detail" table (p95/stddev, plus a bootstrap CI when `--keep-samples` data
 is present — see below) follows the main comparison.
 
-`--threshold` mode only accepts exactly 2 files (baseline, then latest) and
-exits `0` if nothing regressed past the threshold, or `3` with a
-regressions table listing metric/baseline/latest/% change if something did
-— suitable for a CI gate on dotfiles/config changes. `--threshold` works
-the same way regardless of `--format`.
+`--threshold` mode is the regression gate. It exits `0` if nothing got
+worse past the threshold, or `3` with a table of the flagged rows. The
+threshold must be a non-negative percentage (`10%` or `10`); anything else
+is a usage error (exit `2`). The report it prints states every rule it
+applied.
 
-### Statistical rigor (`--keep-samples`, bootstrap CI, significance)
+- **Two files** (baseline, then latest): each row is judged on the
+  threshold alone. There is no significance test, and the report and a
+  stderr line say so. Identical configurations differ by a few percent from
+  run to run, so use a threshold well above that or pass repeated runs.
+- **Groups of runs** (`BASELINE... --latest LATEST...`): each row is
+  compared on the median of its per-run medians. With **at least 4 runs on
+  each side**, a flagged row fails only if a Mann-Whitney U test across the
+  run medians gives p<0.05. With fewer runs the test cannot reach that
+  level, so the threshold alone decides, as in the two-file form. This form
+  prints the Markdown regression report only.
+- **Absolute rule**: a percentage-unit row whose baseline median is 0 (an
+  idle `resource.cpu`) has no relative change. It fails when the latest
+  median is more than `--threshold-points` (default 5) percentage points
+  above the baseline. Percentage-unit rows with a non-zero baseline must
+  also move by more than 1 point, the resolution of one sampling window.
+- A baseline row with no counterpart in any latest run exits `3`: a metric
+  that disappeared cannot pass the gate. A zero-baseline row in another
+  unit is listed as not evaluated.
+
+Trials inside a run are never used for significance. They share the run's
+conditions, and testing them made two identical runs look different about
+a quarter of the time; see [`docs/aa-baseline.md`](docs/aa-baseline.md).
+
+### A/A self-check (`tbench aa`)
+
+Before trusting a threshold, measure what your machine does with no change
+at all:
+
+```sh
+# 8 runs of one scenario, then the analysis
+bin/tbench aa --scenario shell-startup
+
+# Analyse reports you already have of one configuration
+bin/tbench aa --from results/aa-*/aa-*.json
+```
+
+`aa` runs the same configuration `--repeats` times (default 8), then for
+each row shows the spread of the per-run medians and how many of the
+possible half-vs-half splits the regression gate would fail at each of
+`--thresholds` (default `0,2,5,10`). Every one of those failures is noise,
+so the output ends with the smallest tested threshold that produced none.
+With fewer than 8 runs the halves are too small for the gate's significance
+test and the figures are for the threshold alone. The runs share one
+session, so leave headroom for drift between sessions.
+[`docs/aa-baseline.md`](docs/aa-baseline.md) has reference numbers.
+
+### Raw samples and the bootstrap CI (`--keep-samples`)
 
 By default `run` only keeps median/p95/stddev — the raw per-trial values
 are discarded once those are computed, keeping report size/shape exactly
 as before. `run --keep-samples` attaches each result's raw samples (in the
-result's own unit — the same values median/p95/stddev were computed from)
+result's own unit, in trial order — the retained trials median and stddev were computed from; p95 also covers the dropped ones)
 as a `"samples"` array, opt-in specifically because it changes JSON size
 (20 trials ≈ 20 extra numbers per result).
 
-When `compare` finds `"samples"` on both files being compared for a
-metric, it (stdlib-only — no SciPy, matching the rest of the project's
-"no added dependencies" stance):
-
-- Computes a **bootstrap 95% CI on the median** (1000 resamples,
-  fixed-seed so the CI is reproducible from the same samples) and shows it
-  in the Markdown detail table, the HTML report's table view and tooltip,
-  and as a band in each per-metric chart. Without samples, the chart uses a
-  median→p95 whisker instead.
-- In `--threshold` mode, requires a **Mann-Whitney U test** (two-sided,
-  normal approximation with tie correction) to also report p<0.05 before
-  counting a threshold-exceeding row as an actual regression — a metric
-  that moved past the threshold but whose baseline/latest distributions
-  still overlap heavily (noise, not a real change) is reported but marked
-  "no" under Significant?/Regression?, and doesn't fail the run. Rows
-  where either file lacks samples for that metric fall back to the
-  original threshold-only check (unchanged behavior — this is fully
-  backward compatible with reports that never used `--keep-samples`).
+When `compare` finds `"samples"` on a file, it computes a **bootstrap 95%
+CI on the median** (1000 resamples, fixed-seed so the CI is reproducible
+from the same samples) and shows it in the Markdown detail table, the HTML
+report's table view and tooltip, and as a band in each per-metric chart.
+Without samples, the chart uses a median→p95 whisker instead. The interval
+describes the trials of that one run; it does not cover run-to-run
+variation. The regression gate does not use samples.
 
 ### Automated multi-emulator runs (`orchestrate`, macOS only)
 
@@ -259,7 +343,7 @@ An app that's already running when its turn comes up is **not quit** —
 `orchestrate` only warns that its existing windows may add load to the
 measurement, since silently closing a user's terminal session to get a
 cleaner benchmark would be a worse trade. An app name with no adapter
-(anything other than `ghostty`/`iterm`/`terminal`, case-insensitively) is
+(anything other than `ghostty`/`iterm`/`terminal`/`noa`, case-insensitively) is
 skipped with a warning rather than falling back to generic UI-scripting
 automation, which is fragile and would need its own (separate)
 Accessibility permission grant for a result that isn't guaranteed to work;
@@ -275,7 +359,7 @@ A single self-contained file — inline SVG + vanilla JS only, no external
 CDN/fonts/images — with one dot-and-interval chart per `metric`+variant+unit
 combination (never mixing units on one axis), grouped into sections in this
 order: Render Throughput, Latency, Resource, Shell. The report includes a
-**Wins per entity** tally, a **Results at a glance** table showing every
+**Results at a glance** table showing every
 entity's median and direction-aware competition rank for each metric (exact
 median ties share a rank: `1, 1, 3`), an **Overview vs baseline**, and the
 per-metric charts. Each chart:
@@ -320,9 +404,12 @@ identity — if the accumulated reports span more than one terminal (e.g. you
 re-ran `tbench run` in Ghostty and again in iTerm over time), each terminal
 becomes its own colored line/table column rather than being averaged
 together. Markdown output is one table per `metric [variant] (shell) (unit)`
-row: timestamp, terminal, median, and a `Δ%` vs that terminal's previous
-point, annotated `(better)`/`(worse)` (direction-aware, same convention as
-`compare`). The HTML report is one small-multiple line chart per row
+row: timestamp, terminal, median, and the change from that terminal's
+previous point. The change is annotated `(better)`/`(worse)`
+(direction-aware) only beyond a noise band, `--noise PCT` (default 5%);
+inside it the number is shown as `(within noise)`, because identical runs
+already differ by a few percent ([`docs/aa-baseline.md`](docs/aa-baseline.md)).
+Percentage-unit rows are compared in points with a band of 1 point. The HTML report is one small-multiple line chart per row
 (x = report index, y = median), zero-baselined by default — except a
 narrow-range series (all values within ~20% of each other) gets a
 non-zero, explicitly annotated baseline so the line isn't flattened to
@@ -341,18 +428,17 @@ this table and the sections below are the summary. `show` (and
 | Metric | Unit | Shell-scoped? | Variants | What it measures |
 |---|---|---|---|---|
 | `shell.startup` | ms | yes | — | `{shell} -i -c exit` wall-clock time — interactive startup including rc files |
-| `cmd.overhead` | μs | yes | — | `{shell} -c true` wall-clock time — shell spawn + builtin dispatch |
+| `cmd.overhead` | μs | yes | — | `{shell} -c true` wall-clock time — dominated by process spawn and shell initialization; not a differential against a direct exec |
 | `render.throughput` | MB/s, lines/s | no | `plain`, `ansi`, `cjk` | Producer-side completion rate for a fixed fixture written to the terminal |
-| `scroll.proxy` | ms | no | — | Proxy: wall-clock time until a large `cat` producer exits |
-| `input.latency` | ms | no | `idle`, `loaded` | PTY round trip: write a byte into a `cat` spawned on a fresh pty, time until it echoes back |
-| `resource.mem` | MB | no | `idle`, `load` | RSS of the terminal emulator's own GUI process |
-| `resource.cpu` | % | no | `idle`, `load` | %CPU of the terminal emulator's own GUI process |
+| `scroll.proxy` | ms | no | — | Proxy: wall-clock time to write the `plain` fixture to the terminal |
+| `resource.mem` | MB | no | `idle`, `load` | RSS of the terminal emulator's own process |
+| `resource.cpu` | % | no | `idle`, `load` | CPU use of the terminal emulator's own process (Linux: CPU time per 1 s window; macOS: `ps %cpu`) |
 | `fire.fps` | fps | no | `<columns>x<rows>` | Producer-completed frames/second of the deterministic DOOM-fire stream at the recorded region |
 
 Each metric runs N trials (default 20, `--runs`) and reports median, stddev,
-and p95. `resource.mem`/`resource.cpu` instead take up to 5 point-in-time
-`ps` samples per variant (fewer if `--runs` < 5, since sampling a live
-process 20 times isn't meaningfully different from 5). `fire.fps` is
+and p95. `resource.mem`/`resource.cpu` instead take up to 5 samples per
+variant (fewer if `--runs` < 5): one-second windows on Linux, point-in-time
+`ps` samples on macOS. `fire.fps` is
 duration-based rather than iteration-based: each trial runs `FIRE_SECS`
 wall-clock seconds (env var, default 5; finite range 0.1–60), and the trial count used is
 `min(--runs, 5)` for the same reason `resource.*` caps its sample count —
@@ -361,13 +447,13 @@ wall-clock unreasonably long.
 
 **Shell-scoped vs. not**: `shell.startup`/`cmd.overhead` run once per entry
 in `--shells` and report `"shell"` accordingly. `render.throughput`,
-`scroll.proxy`, `input.latency`, and `fire.fps` measure the terminal
-emulator itself, not any particular shell, so they ignore `--shells`, run
+`scroll.proxy`, and `fire.fps` are written to the terminal
+emulator, not any particular shell, so they ignore `--shells`, run
 once, and report `"shell": null`.
 
 ### Comparing terminal emulators
 
-`render.throughput`/`scroll.proxy`/`input.latency` results are only
+`render.throughput`/`scroll.proxy`/`fire.fps` results are only
 meaningful in the context of the emulator they ran in. Each report's
 `meta.terminal` field (from `$TERM_PROGRAM`/`$TERM_PROGRAM_VERSION`, falling
 back to `$TERM`) identifies that emulator — to compare emulators, run
@@ -384,15 +470,15 @@ against `plain`/`ansi` — the same visual width costs more bytes. Use
 runs by roughly 2 for their double-width terminal columns) for a more
 apples-to-apples pace comparison across variants.
 
-### `input.latency` variants: idle / loaded
+### `input.latency` is retired
 
-`loaded` runs the same PTY round-trip measurement as `idle`, but with a
-`render.throughput`-style flood (the `plain` fixture) streaming to the
-terminal concurrently in the background, to see how much terminal I/O
-contention degrades echo latency and, especially, its **jitter (p95)**. If
-the flood cannot start, no `loaded` row is emitted; the run never relabels
-an idle measurement as loaded. Flood cleanup is handled by the integrated
-child-process helper in `src/measure.rs`.
+`run` no longer emits `input.latency`. It opened a fresh pty and timed the
+echo of one byte, and that echo comes from the kernel's line discipline: the
+same ~0.01 ms round trip appears with no `cat` and no terminal emulator
+attached. The number said nothing about the terminal it was reported under,
+and its `loaded` variant only reflected CPU contention from the flood. The
+profile stays registered in Reporting Spec v1 so older reports still
+validate and render.
 
 ### `fire.fps`: DOOM-fire IO stress
 
@@ -418,46 +504,69 @@ producer design are identical to the C tool, so fps from the two is
 directly comparable; the retired serial (v1) producer's numbers are not —
 check `backend` before comparing `fire.fps` values across reports.
 
-### `resource.mem` / `resource.cpu`: which process, and macOS `%cpu` caveat
+### `resource.mem` / `resource.cpu`: which process, and how it is sampled
 
-These target the **terminal emulator's own GUI process**, not the shell or
-`tbench` itself. It's found by walking the process ancestry from `tbench`
-upward to the first executable living inside a macOS `.app` bundle
-(`.../Contents/MacOS/<bin>`). If none is found — inside `tmux`, over SSH, or
-on non-macOS — the scenario is **skipped with a stderr warning** rather
-than misattributing resource usage to the wrong process.
+These target the **terminal emulator's own process**, not the shell or
+`tbench` itself. The scenario runs first in a full `run`, so `idle` is
+sampled before any other scenario has pushed output through the terminal.
 
-macOS's `ps -o %cpu` is a **decayed running average**, not an instantaneous
-sample. `tbench` mitigates this by taking several samples per variant and
-reporting the median, but that's a mitigation, not a fix — treat
-`resource.cpu` as directional, not a precise instant-CPU reading.
+**Linux** (backend `procfs`): the target is the process holding the master
+side of `tbench`'s controlling pty, found through `/proc/<pid>/fdinfo`.
+Each variant takes up to 5 one-second windows (fewer if `--runs` < 5); the
+`load` variant starts sampling 1 s after the flood begins.
+
+- `resource.mem` is RSS at the end of each window (`/proc/<pid>/statm`,
+  the figure `ps -o rss` shows).
+- `resource.cpu` is user plus system CPU time accumulated during the
+  window as a percentage of one core, at kernel clock-tick resolution
+  (1 percentage point per window at 100 ticks/s). This is reported under
+  its own profile, `org.terminalbench.resource.cpu.window`, because it is
+  a different method from the `ps` figure.
+- The report's `extensions["org.terminalbench.resource"]` records the pid,
+  executable, thread count, how many pty masters the process holds (more
+  than one means it also serves other windows, tabs or panes), PSS per
+  variant, and when each variant's sampling started. Extensions never affect comparability.
+
+If the pty belongs to tmux, screen, `script`, sshd, mosh, zellij, dtach or
+abduco, or no readable process holds it, the scenario is **skipped with a
+stderr warning**. Helper processes of multi-process emulators are not
+included.
+
+**macOS** (backend `ps`): the target is found by walking the process
+ancestry from `tbench` upward to the first executable living inside a
+`.app` bundle (`.../Contents/MacOS/<bin>`); inside `tmux` or over SSH none
+is found and the scenario is skipped. Up to 5 `ps` samples are taken 200 ms
+apart. macOS's `ps -o %cpu` is a **decayed running average**, not an
+instantaneous sample; taking the median of several samples is a
+mitigation, not a fix, so treat `resource.cpu` there as directional.
+
+Other systems are skipped.
 
 ### Proxy/approximate metrics — read before trusting the numbers
 
 - `scroll.proxy` has **no native scroll or redraw-event API** behind it. It
-  is literally the wall-clock time for a large `cat` producer to finish
-  writing — it does not observe terminal settling and is not a true redraw-event
+  is literally the wall-clock time to write the `plain` fixture, the same
+  measurement as `render.throughput [plain]` — it does not observe terminal settling and is not a true redraw-event
   measurement (proposal §3 item 3).
-- `input.latency` measures a **pseudo-terminal round trip** (write a byte
-  into a `cat` spawned on a fresh pty, time until it's read back), not real
-  keypress-to-screen-photon latency. True input latency needs GUI
-  automation, which is out of scope (proposal §6.6 extension 3). It also
-  requires opening a pty; if none is available (e.g. some sandboxed/CI
-  environments) the scenario is skipped with a stderr warning rather than
-  failing the whole run. A timeout or missing echo invalidates the variant;
-  the PTY line discipline itself may provide the observed echo.
+- `render.throughput`/`scroll.proxy`/`fire.fps` describe whatever reads the
+  controlling tty. Inside `tmux` or GNU `screen` that is the multiplexer,
+  not the emulator: `run` warns on stderr and records it in
+  `meta.meta_notes`. On Linux the same happens when the pty master is held
+  by `script`, sshd, mosh, zellij, dtach or abduco.
 - `render.throughput`/`scroll.proxy`/`fire.fps` need a controlling terminal
   (`/dev/tty`) to measure the registered PTY workload. Without one
   (non-interactive/CI contexts), those metrics are skipped; no `/dev/null`
   substitute is reported under the same profile.
-- `render.throughput` and `scroll.proxy` time the complete `cat` process,
-  including process creation and fixture reads; page-cache state is therefore
-  part of these producer-side proxy results.
+- `render.throughput` and `scroll.proxy` time only the write of an
+  in-memory fixture to the terminal (backend `rust-writer`). Reports from
+  earlier versions timed a whole external `cat` process including its
+  startup and file read (backend `rust-timer`); the gate treats the two as
+  NOT_COMPARABLE.
 - `fire.fps` reports frames/second, but — like `render.throughput` — it is
   a producer-side PTY-write-completion proxy, not a confirmed on-screen
   frame rate; see the caveat above.
-- `resource.mem`/`resource.cpu` are unavailable outside a directly-launched
-  macOS terminal emulator (see caveat above).
+- `resource.mem`/`resource.cpu` need a directly-launched terminal emulator
+  on Linux or macOS (see above).
 
 Every result carries these caveats inline via an optional `"notes"` field
 in the JSON (see schema below) so they travel with the data.
@@ -472,7 +581,8 @@ dependency — warmup + outlier handling, hyperfine's main advantages over
 the old fallback, are now built in.
 
 Each result object includes a `"backend"` field (`"rust-timer"`,
-`"rust-pty"` for `input.latency`, `"ps"` for `resource.*`,
+`"rust-writer"` for `render.throughput`/`scroll.proxy`,
+`"ps"` or `"procfs"` for `resource.*`,
 `"fire-v2-overlapped"` for `fire.fps`) so reports are traceable to the
 backend that produced them. Reports from the earlier backends
 (`hyperfine`, `zsh-timer`, `zsh-zpty`) remain conformant under Reporting
@@ -490,26 +600,38 @@ make check        # lint + test — what CI runs
 ```
 
 CI (`.github/workflows/ci.yml`) runs `make lint`, `make unit`, and the
-conformance suite on a macOS runner with the explicit `TBENCH_*` controls
-from the section above.
+conformance suite on Linux and macOS runners with the explicit `TBENCH_*`
+controls from the section above. Runners have no controlling terminal, so
+`tests/pty_run.rs` runs the whole suite inside a pty it owns and prints
+the rows it got: a tty-bound scenario that stops producing results fails
+CI instead of being skipped. On Linux that covers every scenario
+(`--strict`); on macOS `resource.*` cannot run from a test binary, and the
+test asserts that it is the only scenario without results.
 
 ## Requirements
 
 - A Rust toolchain to build (`cargo build --release`); the result is one
-  self-contained binary with no runtime dependencies
+  binary that carries its scenarios and fixtures, so `cargo install --path .`
+  gives a `tbench` that works from any directory (reports go to
+  `./results/`)
 - the shells being benchmarked (`zsh`/`bash`/... ) on `PATH`
 - a controlling terminal, for `render.throughput`/`scroll.proxy`/
-  `fire.fps`, and a usable pty, for `input.latency` — unavailable metrics
+  `fire.fps` — unavailable metrics
   are skipped with an actionable warning rather than replaced by a
-  different workload
+  different workload; `run` lists the scenarios that produced no results,
+  and `--strict` turns that into exit `1`
 
-No runtime dependencies: hyperfine, python3, and a C compiler are no
-longer needed (`compare`/`show`/`trend`/`validate` are built in, and the
-DOOM-fire workload is an integrated port of the retired C tool with an
-identical byte stream). YAML scenario files keep the fixed flat
-`key: value` structure, parsed by the built-in reader. Fixtures for
-`render.throughput`/`scroll.proxy` are generated lazily on first use
-(same content as the retired `fixtures/gen-fixtures.sh`) and gitignored.
+hyperfine, python3, a C compiler and `cat` are not needed at run time
+(`compare`/`show`/`trend`/`validate` are built in, the DOOM-fire workload
+is an integrated port of the retired C tool with an identical byte stream,
+and the output fixtures are generated in memory). The binary still calls a
+few standard tools: `uname` and `date` everywhere, each measured shell with
+`--version`, `ps` for `resource.*` on macOS, and `pmset`, `sysctl`,
+`system_profiler` and `osascript` on macOS for metadata and `orchestrate`.
+
+The scenario files are compiled in. A `scenarios/` directory next to the
+binary or in the working directory takes precedence, which is what a
+checkout uses; the files keep the fixed flat `key: value` structure.
 
 ## Directory layout
 
@@ -518,20 +640,24 @@ bin/tbench           # thin launcher: builds (if needed) and execs the Rust bina
 bin/tbench-validate  # thin launcher for `tbench validate` (Reporting Spec v1 CLI)
 src/main.rs          # CLI dispatch (run/list/show/compare/trend/orchestrate/validate)
 src/stats.rs         # median/p95/stddev, IQR, bootstrap CI, Mann-Whitney
-src/measure.rs       # rust-timer backend, adaptive sampling, output flood
+src/measure.rs       # process timer, terminal writer, adaptive sampling, output flood
 src/scenario.rs      # scenarios/*.yaml loading (flat key: value reader)
-src/runner.rs        # scenario kind dispatch, fixtures, pty latency
+src/runner.rs        # scenario kind dispatch
 src/lock.rs          # results/.tbench.lock concurrent-run detection
 src/resource.rs      # terminal-PID discovery, resource.mem/resource.cpu
+src/procfs.rs        # Linux /proc readers (pty-master owner, RSS, PSS, CPU time)
 src/fidelity.rs      # DECSET 2026 synchronized-output probe
 src/fire.rs          # integrated DOOM-fire workload (port of the retired C tool)
 src/report.rs        # Reporting Spec v1 JSON assembly + env metadata
+src/linuxhost.rs     # Linux host facts (machine model, CPU, power, low-power mode)
 src/show.rs / compare.rs / trend.rs   # report views (recap, tables/HTML, history)
+src/aa.rs            # A/A self-check of the regression gate
 src/orchestrate.rs   # per-app launch adapters (macOS)
 src/validate.rs      # Reporting Spec v1 reference validator
 scenarios/           # *.yaml scenario definitions
 schemas/             # tbench-report-v1.schema.json (Reporting Spec v1)
 tests/report-v1.sh   # Reporting Spec v1 conformance suite (make conformance)
+tests/pty_run.rs     # full run inside a pty, so CI covers tty-bound scenarios
 docs/                # proposals, metric guide, reporting spec
 fixtures/            # generated *.txt (gitignored) + conformance/ corpus
 results/             # JSON/HTML output + .tbench.lock (gitignored)
@@ -550,15 +676,14 @@ semantic conformance, claim safety, or pairwise comparability; use
 ## Known limitations
 
 - `bin/tbench run` still only emits JSON (no Markdown report from `run`
-  itself — `compare` produces Markdown/HTML from existing JSON files); no
-  fish shell support; no `prompt.render` metric — deferred to later phases
+  itself — `compare` produces Markdown/HTML from existing JSON files); no `prompt.render` metric — deferred to later phases
   (proposal §6.6 extension 2/3).
 - `--runs auto` only converges for `shell.startup`/`cmd.overhead`/
-  `render.throughput`/`scroll.proxy`; `input.latency`/`resource.*`/
+  `render.throughput`/`scroll.proxy`; `resource.*`/
   `fire.fps` fall back to a fixed trial count with a stderr note.
 - The concurrent-run lock only detects other `tbench run` processes, not
   unrelated system load (a build, backups, etc.) — see caveat above.
-- `orchestrate` is macOS-only, supports `ghostty`/`iterm`/`terminal` only
+- `orchestrate` is macOS-only, supports `ghostty`/`iterm`/`terminal`/`noa` only
   (see above for adding an adapter), and can't guarantee the new window
   actually has keyboard/tty focus — that's an emulator implementation
   detail, and an unfocused window could skew `render.throughput` etc.
@@ -566,18 +691,16 @@ semantic conformance, claim safety, or pairwise comparability; use
   synchronized output — it does not confirm any given run actually
   avoided frame skipping (that would need screen-capture + a permission
   grant, judged not worth it yet per proposal §C).
-- `--keep-samples`/bootstrap CI/Mann-Whitney significance all require both
-  files being compared to carry `"samples"` for the same metric; without
-  that, `compare` falls back to the original median/p95/stddev-only,
-  threshold-only behavior — fully backward compatible with reports from
-  before this feature existed.
-- `scroll.proxy` and `input.latency` are approximations, not true
-  redraw-event / photon-latency measurements — see caveats above.
+- The bootstrap CI needs `--keep-samples` data and describes one run only.
+  The regression gate's significance test needs at least 4 runs per side.
+- `scroll.proxy` is an approximation, not a true redraw-event
+  measurement — see caveats above.
 - `render.throughput`'s `cjk` variant's MB/s isn't directly comparable to
   `plain`/`ansi`'s (different bytes-per-character) — see caveat above.
 - `resource.mem`/`resource.cpu` only work when `tbench` runs inside a
-  directly-launched macOS terminal emulator (not tmux/SSH/non-macOS), and
-  `resource.cpu` inherits macOS's decayed-average `%cpu` semantics.
+  directly-launched terminal emulator on Linux or macOS (not tmux/SSH).
+  The two platforms use different CPU methods and profiles, and on macOS
+  `resource.cpu` inherits the decayed-average `%cpu` semantics.
 - `fire.fps`'s `--runs` is duration-based (`FIRE_SECS`, finite range
   0.1–60 seconds per trial) and capped at 5 trials regardless of `--runs`, unlike the
   iteration-based scenarios.

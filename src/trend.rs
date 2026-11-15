@@ -1,10 +1,9 @@
-//! `tbench trend` — port of lib/trend.py (longitudinal per-metric history
-//! across accumulated reports; markdown tables + HTML line charts).
+//! `tbench trend` — longitudinal per-metric history across accumulated
+//! reports: markdown tables + HTML line charts.
 //!
 //! Reports are sorted by meta.timestamp (ISO8601 lexicographic order);
 //! each report's meta.terminal is its series identity — multiple terminals
-//! become multiple series/columns and are never averaged together. See
-//! lib/trend.py for the authoritative behavior this mirrors.
+//! become multiple series/columns and are never averaged together.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,8 +15,7 @@ use crate::show::{section_for, unit_display};
 
 // (light, dark) hex pairs — dataviz reference palette, CVD-safe order.
 // Color is assigned by terminal (first-appearance order across the
-// chronologically-sorted reports), fixed across every chart. Copied from
-// lib/trend.py's PALETTE.
+// chronologically-sorted reports), fixed across every chart.
 const PALETTE: &[(&str, &str)] = &[
     ("#2a78d6", "#3987e5"), // 1 blue
     ("#008300", "#008300"), // 2 green
@@ -217,18 +215,52 @@ fn delta_annot(pct: f64, higher_better: bool) -> Option<&'static str> {
     }
 }
 
-fn format_delta(prev: Option<f64>, median: Option<f64>, higher_better: bool) -> String {
-    match (prev, median) {
-        (Some(prev), Some(median)) if prev != 0.0 => {
-            let pct = (median - prev) / prev * 100.0;
-            let annot = delta_annot(pct, higher_better);
-            let base = format!("{pct:+.1}%");
-            match annot {
-                Some(a) => format!("{base} ({a})"),
-                None => base,
+/// Default band inside which a change between two reports is not called
+/// better or worse. Identical runs on one machine differed by 1 to 6% in
+/// docs/aa-baseline.md; `tbench aa` measures it for a given setup.
+pub const DEFAULT_NOISE: f64 = 0.05;
+/// One sampling tick: percentage-unit rows cannot resolve less.
+const NOISE_POINTS: f64 = 1.0;
+
+/// Change from the previous point of the same terminal. A verdict
+/// (better/worse) is given only outside the noise band; inside it the
+/// number is shown and marked as noise. Percentage-unit rows are compared
+/// in points, since a relative change from 1% to 2% means nothing.
+fn format_delta(
+    prev: Option<f64>,
+    median: Option<f64>,
+    higher_better: bool,
+    unit: &str,
+    noise: f64,
+) -> String {
+    let (Some(prev), Some(median)) = (prev, median) else {
+        return "-".to_string();
+    };
+    if unit == "pct" {
+        let points = median - prev;
+        return if points.abs() <= NOISE_POINTS {
+            format!("{points:+.1} pt (within noise)")
+        } else {
+            match delta_annot(points, higher_better) {
+                Some(a) => format!("{points:+.1} pt ({a})"),
+                None => format!("{points:+.1} pt"),
             }
+        };
+    }
+    if prev == 0.0 {
+        return "-".to_string();
+    }
+    let pct = (median - prev) / prev * 100.0;
+    let base = format!("{pct:+.1}%");
+    if pct == 0.0 {
+        base
+    } else if pct.abs() <= noise * 100.0 {
+        format!("{base} (within noise)")
+    } else {
+        match delta_annot(pct, higher_better) {
+            Some(a) => format!("{base} ({a})"),
+            None => base,
         }
-        _ => "-".to_string(),
     }
 }
 
@@ -285,6 +317,7 @@ fn build_markdown_report(
     reports: &[Report],
     order: &[Key],
     rows: &HashMap<Key, Vec<Point>>,
+    noise: f64,
 ) -> String {
     let mut sections: HashMap<&str, Vec<&Key>> = HashMap::new();
     for name in SECTION_ORDER {
@@ -298,6 +331,11 @@ fn build_markdown_report(
         "# tbench trend".to_string(),
         String::new(),
         format!("Reports: {} (chronological)", reports.len()),
+        String::new(),
+        format!(
+            "Δ is the change from that terminal's previous report. It is called better or worse only beyond ±{:.0}% (±1 point for percentage rows); smaller changes are within what identical runs show (`tbench aa`, `--noise PCT`).",
+            noise * 100.0
+        ),
         String::new(),
     ];
 
@@ -314,7 +352,7 @@ fn build_markdown_report(
             points.sort_by_key(|p| p.idx);
             lines.push(format!("### {}", row_label(key)));
             lines.push(String::new());
-            lines.push("| Timestamp | Terminal | Median | Δ% |".to_string());
+            lines.push("| Timestamp | Terminal | Median | Δ |".to_string());
             lines.push("|---|---|---|---|".to_string());
             let mut last_by_terminal: HashMap<String, f64> = HashMap::new();
             for p in points {
@@ -324,8 +362,13 @@ fn build_markdown_report(
                 let median = res.median;
 
                 let prev = last_by_terminal.get(terminal).copied();
-                let delta_str =
-                    format_delta(prev, median, is_higher_better(metric, &res.direction));
+                let delta_str = format_delta(
+                    prev,
+                    median,
+                    is_higher_better(metric, &res.direction),
+                    &key.3,
+                    noise,
+                );
                 if let Some(m) = median {
                     last_by_terminal.insert(terminal.clone(), m);
                 }
@@ -873,6 +916,7 @@ pub fn cmd_trend(args: &[String], root: &Path) -> ExitCode {
     let mut format = "markdown".to_string();
     let mut output: Option<PathBuf> = None;
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut noise = DEFAULT_NOISE;
 
     let mut i = 0;
     while i < args.len() {
@@ -889,6 +933,21 @@ pub fn cmd_trend(args: &[String], root: &Path) -> ExitCode {
                     return die("tbench: --output requires a value", 2);
                 }
                 output = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--noise" => {
+                match args
+                    .get(i + 1)
+                    .and_then(|v| crate::compare::parse_threshold(v))
+                {
+                    Some(v) => noise = v,
+                    None => {
+                        return die(
+                            "tbench: --noise requires a non-negative percentage such as 5%",
+                            2,
+                        )
+                    }
+                }
                 i += 2;
             }
             other if other.starts_with("--") => {
@@ -964,7 +1023,7 @@ pub fn cmd_trend(args: &[String], root: &Path) -> ExitCode {
         build_html_report(&reports, &source_files)
     } else {
         let (order, rows) = collect_rows(&reports);
-        build_markdown_report(&reports, &order, &rows)
+        build_markdown_report(&reports, &order, &rows, noise)
     };
 
     if let Some(path) = &output {
@@ -1014,23 +1073,33 @@ mod tests {
     }
 
     #[test]
-    fn format_delta_matches_python() {
-        // +10% on a higher-is-better metric.
+    fn deltas_get_a_verdict_only_outside_the_noise_band() {
+        let d = |prev, cur, higher| format_delta(prev, cur, higher, "ms", 0.05);
+        assert_eq!(d(Some(100.0), Some(110.0), true), "+10.0% (better)");
+        assert_eq!(d(Some(100.0), Some(90.0), false), "-10.0% (better)");
+        assert_eq!(d(Some(100.0), Some(110.0), false), "+10.0% (worse)");
+        // inside the band: the number stays, the verdict goes
+        assert_eq!(d(Some(100.0), Some(103.0), false), "+3.0% (within noise)");
+        assert_eq!(d(Some(100.0), Some(95.0), true), "-5.0% (within noise)");
+        assert_eq!(d(Some(100.0), Some(100.0), true), "+0.0%");
+        // no previous point, a zero previous, or a missing median
+        assert_eq!(d(None, Some(100.0), true), "-");
+        assert_eq!(d(Some(0.0), Some(100.0), true), "-");
+        assert_eq!(d(Some(100.0), None, true), "-");
+        // --noise 0 restores a verdict on every change
         assert_eq!(
-            format_delta(Some(100.0), Some(110.0), true),
-            "+10.0% (better)"
+            format_delta(Some(100.0), Some(100.4), false, "ms", 0.0),
+            "+0.4% (worse)"
         );
-        // -10% on a lower-is-better metric reads as better.
-        assert_eq!(
-            format_delta(Some(100.0), Some(90.0), false),
-            "-10.0% (better)"
-        );
-        // exact zero delta -> no annotation, keeps the sign.
-        assert_eq!(format_delta(Some(100.0), Some(100.0), true), "+0.0%");
-        // no previous point, or a zero previous, or a missing median -> "-".
-        assert_eq!(format_delta(None, Some(100.0), true), "-");
-        assert_eq!(format_delta(Some(0.0), Some(100.0), true), "-");
-        assert_eq!(format_delta(Some(100.0), None, true), "-");
+    }
+
+    #[test]
+    fn percentage_rows_are_compared_in_points() {
+        let d = |prev, cur| format_delta(Some(prev), Some(cur), false, "pct", 0.05);
+        assert_eq!(d(1.0, 2.0), "+1.0 pt (within noise)");
+        assert_eq!(d(0.0, 0.0), "+0.0 pt (within noise)");
+        assert_eq!(d(0.0, 20.0), "+20.0 pt (worse)");
+        assert_eq!(d(40.0, 30.0), "-10.0 pt (better)");
     }
 
     #[test]

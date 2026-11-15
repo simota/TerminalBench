@@ -68,7 +68,7 @@ Known control identifiers use these canonical registries:
 - `power_source`: `ac`, `battery`, or `ups`.
 - `<token>`: lowercase ASCII beginning with an alphanumeric and then containing only alphanumerics, `.`, `_`, or `-`.
 
-`machine_model` is a case-sensitive, trimmed opaque identifier: leading/trailing whitespace and line breaks are forbidden. Its source SHOULD be the platform's stable hardware-model identifier (the reference emitter uses macOS `sysctl -n hw.model`), or an explicitly supplied CI value. A producer MUST NOT case-fold or reinterpret it.
+`machine_model` is a case-sensitive, trimmed opaque identifier: leading/trailing whitespace and line breaks are forbidden. Its source SHOULD be the platform's stable hardware-model identifier, or an explicitly supplied CI value. The reference emitter uses macOS `sysctl -n hw.model`; on Linux it uses the DMI system vendor and product name (the board vendor and name when those are firmware placeholders, or the device-tree model), followed by ` / ` and the CPU model name. A producer MUST NOT case-fold or reinterpret it.
 
 `meta` preserves the legacy consumer surface. It MUST contain non-empty string `timestamp` (RFC 3339 date-time), `os`, `runner`, `terminal`, and `shell`, plus `synchronized_output_supported` (`supported`, `unsupported`, or `no_reply`). It MAY contain `frame_skip_risk_note`, `power_source`, `low_power_mode` (boolean), `machine_model`, `cpu`, `gpu`, `display_refresh_hz` (positive number), and `meta_notes`; no other member is allowed. `meta` is descriptive; pairwise eligibility uses `run_context`, not values guessed from `meta`.
 
@@ -98,12 +98,13 @@ All profiles have `profile_version=1.0.0`, `method_version=1.0.0`. Exact registe
 |---|---|---|---|---|---|---|---|---|
 | `shell.startup` / `ms` | `org.terminalbench.shell.startup` | sampled | `org.terminalbench.method.process-wall-clock` | `shell-process-startup` | `process-invocation-to-process-exit` | lower | null | `hyperfine`, `zsh-timer`, `rust-timer` |
 | `cmd.overhead` / `us` | `org.terminalbench.command.overhead` | sampled | `org.terminalbench.method.process-wall-clock` | `shell-command-process` | `process-invocation-through-command-exit` | lower | null | `hyperfine`, `zsh-timer`, `rust-timer` |
-| `render.throughput` / `MBps` | `org.terminalbench.render.throughput.bytes` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `fixture-write-start-to-producer-exit` | higher | plain, ansi, cjk | `zsh-timer`, `rust-timer` |
-| `render.throughput` / `linesps` | `org.terminalbench.render.throughput.lines` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `fixture-write-start-to-producer-exit` | higher | plain, ansi, cjk | `zsh-timer`, `rust-timer` |
-| `scroll.proxy` / `ms` | `org.terminalbench.scroll.proxy` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-and-scrollback-proxy` | `fixture-write-start-to-producer-exit` | lower | null | `zsh-timer`, `rust-timer` |
+| `render.throughput` / `MBps` | `org.terminalbench.render.throughput.bytes` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `fixture-write-start-to-producer-exit` | higher | plain, ansi, cjk | `zsh-timer`, `rust-timer`, `rust-writer` |
+| `render.throughput` / `linesps` | `org.terminalbench.render.throughput.lines` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `fixture-write-start-to-producer-exit` | higher | plain, ansi, cjk | `zsh-timer`, `rust-timer`, `rust-writer` |
+| `scroll.proxy` / `ms` | `org.terminalbench.scroll.proxy` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-and-scrollback-proxy` | `fixture-write-start-to-producer-exit` | lower | null | `zsh-timer`, `rust-timer`, `rust-writer` |
 | `input.latency` / `ms` | `org.terminalbench.input.pty-round-trip` | proxy | `org.terminalbench.method.zpty-echo-round-trip` | `pseudo-terminal-echo` | `byte-write-to-pty-echo-read` | lower | idle, loaded | `zsh-zpty`, `rust-pty` |
-| `resource.mem` / `MB` | `org.terminalbench.resource.memory` | sampled | `org.terminalbench.method.process-sample` | `terminal-process-resident-memory` | `identified-terminal-process-rss-sample` | lower | idle, load | `ps` |
+| `resource.mem` / `MB` | `org.terminalbench.resource.memory` | sampled | `org.terminalbench.method.process-sample` | `terminal-process-resident-memory` | `identified-terminal-process-rss-sample` | lower | idle, load | `ps`, `procfs` |
 | `resource.cpu` / `pct` | `org.terminalbench.resource.cpu` | sampled | `org.terminalbench.method.process-sample` | `terminal-process-cpu` | `identified-terminal-process-cpu-sample` | lower | idle, load | `ps` |
+| `resource.cpu` / `pct` | `org.terminalbench.resource.cpu.window` | sampled | `org.terminalbench.method.process-cpu-time-window` | `terminal-process-cpu` | `identified-terminal-process-cpu-time-over-wall-clock-window` | lower | idle, load | `procfs` |
 | `fire.fps` / `fps` | `org.terminalbench.fire.fps.geometry` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `frame-write-start-to-producer-exit` | higher | `<width>x<rows>` (`1..1000` × `1..500`) | `fire-v2-overlapped` |
 | `fire.fps` / `fps` | `org.terminalbench.fire.fps` | proxy | `org.terminalbench.method.pty-write-wall-clock` | `pty-output-pipeline` | `frame-write-start-to-producer-exit` | higher | null | `fire-v2-overlapped` |
 
@@ -112,6 +113,10 @@ All profiles have `profile_version=1.0.0`, `method_version=1.0.0`. Exact registe
 Registry amendment (2026-07-20): `rust-timer` (built-in monotonic timer of the Rust single-binary implementation, warmup + IQR filtering equivalent to the prior backends) and `rust-pty` (native openpty echo round trip) are registered as additional backends for the profiles listed above. This is additive: existing reports remain conformant, and — as was already the case between `hyperfine` and `zsh-timer` — a pair of reports whose `dimensions.backend` differ is NOT_COMPARABLE under the pairwise gate. `fire-v2-overlapped` is retained by the Rust implementation because its byte stream, seed, frame order, and overlapped producer design are identical to the C tool it ports.
 
 Registry amendment (2026-07-20, geometry identity): new reports use `org.terminalbench.fire.fps.geometry`, whose required variant is the rendered cell region and whose workload is `urn:tbench:workload:fire-{variant}:v1`. The legacy null-variant `org.terminalbench.fire.fps` remains registered solely so existing reports remain valid. Differing geometry variants produce different result identities and therefore are NOT_COMPARABLE; producers MUST NOT omit a geometry that they can observe.
+
+Registry amendment (2026-11-15, in-process writer): `rust-writer` is registered as an additional backend for the render and scroll profiles. The producer is the runner itself: it generates the fixture in memory, writes it to the controlling terminal, and times that write alone. The bytes are identical to the earlier fixtures, so workload identities are unchanged. Earlier backends ran an external `cat` on a fixture file and timed the whole process, including process creation and the file read; values from the two are therefore not interchangeable, and differing backends are NOT_COMPARABLE as before.
+
+Registry amendment (2026-11-15, Linux resource sampling): `procfs` (resident set size read from Linux `/proc/<pid>/statm` for the process holding the master side of the controlling pty) is registered as an additional backend for `org.terminalbench.resource.memory`. `org.terminalbench.resource.cpu.window` is a new profile for the same metric and unit as `org.terminalbench.resource.cpu`: it reports user plus system CPU time accumulated over a fixed wall-clock window as a percentage of one core, which is a different method from the `ps` statistic and therefore a different profile and workload. Both changes are additive. A report MUST NOT carry both CPU profiles for the same variant, because legacy consumers identify a result by metric, shell, unit, and variant.
 
 The exact limitation / excluded-claim / workload triples are:
 
@@ -125,6 +130,7 @@ The exact limitation / excluded-claim / workload triples are:
 | input PTY round trip | `Uses a synthetic PTY echo and excludes physical input devices, GUI event routing, rendering, and display presentation.` | `Physical-keypress-to-photon latency` | `urn:tbench:workload:input-{variant}:v1` |
 | resource memory | `Samples one identified process and may omit helper-process or shared-memory costs.` | `Whole-system memory cost` | `urn:tbench:workload:resource-{variant}:v1` |
 | resource CPU | `Process CPU is a sampled operating-system statistic and is not an instantaneous whole-system measurement.` | `Whole-system CPU cost` | `urn:tbench:workload:resource-{variant}:v1` |
+| resource CPU window (`org.terminalbench.resource.cpu.window`) | `Covers one identified process over fixed wall-clock windows at kernel clock-tick resolution; helper processes are not included.` | `Whole-system CPU cost` | `urn:tbench:workload:resource-window-{variant}:v1` |
 | fire fps (`org.terminalbench.fire.fps.geometry`) | `Measures producer-side PTY write completion for a truecolor repaint stream at the cell geometry recorded by variant; terminal parsing, compositing, and confirmed on-screen frame presentation are not observed.` | `Confirmed on-screen frame rate` | `urn:tbench:workload:fire-{variant}:v1` |
 | fire fps (`org.terminalbench.fire.fps`) | `Measures producer-side PTY write completion for a live window-sized truecolor repaint stream; terminal parsing, compositing, and confirmed on-screen frame presentation are not observed, and fps depends on window cell count.` | `Confirmed on-screen frame rate` | `urn:tbench:workload:fire:v1` |
 
@@ -181,7 +187,9 @@ Third-party validators can run the portable semantic corpus without implementing
 TBENCH_PORTABLE=1 TBENCH_VALIDATOR=/path/to/validator zsh tests/report-v1.sh
 ```
 
-For CI or a non-macOS host, supply stable controls explicitly when platform discovery cannot provide them:
+The reference emitter on Linux derives `power_source` and `low_power_mode` from `/sys/class/power_supply` and the ACPI platform profile, leaves either unknown when it has no sound basis, and records the basis under the `org.terminalbench.host` extension. When `TERM_PROGRAM` is unset it reports the executable name of the process holding the pty master as the terminal identity. It does not discover the display refresh rate.
+
+For CI, or wherever platform discovery cannot provide a control, supply it explicitly:
 
 ```sh
 TBENCH_TERMINAL_ID='ci-terminal 1.0' \

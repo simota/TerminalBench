@@ -1,5 +1,5 @@
 metric: scroll.proxy
 kind: scroll_proxy
 unit: ms
-description: "Proxy metric: total wall-clock time until a large cat producer exits; terminal scrollback settling is not observed."
+description: "Proxy metric: total wall-clock time to write the plain fixture to the terminal; terminal scrollback settling is not observed."
 notes: "Proxy indicator only, not a true scroll/redraw event measurement — see proposal doc section 3 item 3 and README."

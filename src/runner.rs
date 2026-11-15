@@ -1,27 +1,25 @@
-//! Scenario dispatch — port of lib/runner.sh. Loads each scenarios/*.yaml,
-//! dispatches on `kind`, and appends ResultRows. Settle pauses between
+//! Scenario dispatch: runs one scenario by its `kind` and appends
+//! ResultRows. Settle pauses between
 //! scenarios/variants (proposal §A item 1) are the caller's/our shared
 //! guard against cross-contamination.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Instant;
 
-use crate::measure::{self, Runs, Sink};
+use crate::measure::{self, Runs};
 use crate::report::ResultRow;
 use crate::scenario::Scenario;
 use crate::stats;
 
 pub struct RunConfig {
-    pub root: PathBuf,
     pub shells: Vec<String>,
     pub runs: Runs,
     pub warmup: usize,
     pub settle_secs: f64,
     pub keep_samples: bool,
+    /// Vendor data a scenario wants in the report's top-level `extensions`
+    /// object, keyed by reverse-DNS name.
+    pub extensions: std::cell::RefCell<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub fn settle(cfg: &RunConfig) {
@@ -35,7 +33,6 @@ pub fn run_scenario(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<Resu
         "shell" => run_shell(scenario, cfg, results),
         "render_throughput" => run_render_throughput(scenario, cfg, results),
         "scroll_proxy" => run_scroll_proxy(scenario, cfg, results),
-        "input_latency" => run_input_latency(scenario, cfg, results),
         "resource_footprint" => crate::resource::run(scenario, cfg, results),
         "fire" => run_fire(scenario, cfg, results),
         other => {
@@ -94,7 +91,7 @@ fn run_shell(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<ResultRow>)
         };
         let cmd = cmd_template.replace("{shell}", &shell_bin.to_string_lossy());
         let argv = measure::split_command(&cmd);
-        let c = match measure::collect(&argv, cfg.runs, cfg.warmup, Sink::Null) {
+        let c = match measure::collect(&argv, cfg.runs, cfg.warmup) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("tbench: failed to run '{cmd}': {e}; skipping {metric} ({shell})");
@@ -104,12 +101,13 @@ fn run_shell(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<ResultRow>)
         // ms -> scenario unit (only "us" needs scaling today).
         let scale = if unit == "us" { 1000.0 } else { 1.0 };
         let scaled: Vec<f64> = c.samples_ms.iter().map(|v| v * scale).collect();
+        let raw_scaled: Vec<f64> = c.raw_ms.iter().map(|v| v * scale).collect();
         results.push(ResultRow {
             metric: metric.clone(),
             shell: Some(shell.clone()),
             unit: unit.clone(),
             median: stats::median(&scaled),
-            p95: stats::p95(&scaled),
+            p95: stats::tail_p95(&raw_scaled, stats::median(&scaled)),
             stddev: stats::stddev(&scaled),
             runs: scaled.len(),
             outliers_removed: c.outliers_removed,
@@ -121,86 +119,6 @@ fn run_shell(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<ResultRow>)
         produced = true;
     }
     produced
-}
-
-// --- fixtures ------------------------------------------------------------
-
-const FIXTURE_LINES: usize = 100_000;
-const LINE_TEXT: &str = "the quick brown fox jumps over the lazy dog 0123456789 abcdefghijklmnopqrstuvwxyz tbench-render-throughput-fixture-line";
-const LINE_CJK: &str = "こんにちは、世界🌏 The quick brown 狐 jumps over 怠け者の犬 ASCII0123456789 絵文字✨🚀 全角テストtbench-cjk-fixture-line";
-
-fn fixture_is_valid(path: &Path, line: &str, wrap_ansi: bool) -> std::io::Result<bool> {
-    let mut expected = Vec::new();
-    if wrap_ansi {
-        expected.extend_from_slice(b"\x1b[32m");
-    }
-    expected.extend_from_slice(line.as_bytes());
-    if wrap_ansi {
-        expected.extend_from_slice(b"\x1b[0m");
-    }
-    expected.push(b'\n');
-
-    let meta = path.metadata()?;
-    if !meta.is_file() || meta.len() != (expected.len() * FIXTURE_LINES) as u64 {
-        return Ok(false);
-    }
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut actual = Vec::with_capacity(expected.len());
-    for _ in 0..FIXTURE_LINES {
-        actual.clear();
-        reader.read_until(b'\n', &mut actual)?;
-        if actual != expected {
-            return Ok(false);
-        }
-    }
-    let mut trailing = [0u8; 1];
-    Ok(reader.read(&mut trailing)? == 0)
-}
-
-/// Byte-identical port of fixtures/gen-fixtures.sh: validates and lazily
-/// generates the three large-output fixtures on first use. A truncated or
-/// modified fixture is rebuilt instead of being accepted merely as nonempty.
-pub fn gen_fixtures(root: &Path) -> bool {
-    let dir = root.join("fixtures");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("tbench: could not create fixture directory: {e}");
-        return false;
-    }
-    let write = |path: &Path, line: &str, wrap_ansi: bool| -> std::io::Result<()> {
-        match fixture_is_valid(path, line, wrap_ansi) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let mut out = std::io::BufWriter::new(File::create(path)?);
-        for _ in 0..FIXTURE_LINES {
-            if wrap_ansi {
-                out.write_all(b"\x1b[32m")?;
-            }
-            out.write_all(line.as_bytes())?;
-            if wrap_ansi {
-                out.write_all(b"\x1b[0m")?;
-            }
-            out.write_all(b"\n")?;
-        }
-        out.flush()?;
-        if fixture_is_valid(path, line, wrap_ansi)? {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "generated fixture failed validation: {}",
-                path.display()
-            )))
-        }
-    };
-    let ok = write(&dir.join("large-output-plain.txt"), LINE_TEXT, false).is_ok()
-        && write(&dir.join("large-output-ansi.txt"), LINE_TEXT, true).is_ok()
-        && write(&dir.join("large-output-cjk.txt"), LINE_CJK, false).is_ok();
-    if !ok {
-        eprintln!("tbench: fixture generation failed");
-    }
-    ok
 }
 
 // --- kind: render_throughput ---------------------------------------------
@@ -215,31 +133,18 @@ fn run_render_throughput(
         .unwrap_or("render.throughput")
         .to_string();
     let notes = scenario.field("notes").map(str::to_string);
-    if !gen_fixtures(&cfg.root) {
-        eprintln!("tbench: fixture generation failed, skipping render.throughput");
-        return false;
-    }
 
     let mut produced = false;
     for (i, variant) in ["plain", "ansi", "cjk"].iter().enumerate() {
         if i > 0 {
             settle(cfg);
         }
-        let fixture = cfg
-            .root
-            .join(format!("fixtures/large-output-{variant}.txt"));
-        let Ok(meta) = fixture.metadata() else {
-            eprintln!(
-                "tbench: fixture {} missing, skipping render.throughput/{variant}",
-                fixture.display()
-            );
+        let Some(size_bytes) = measure::fixture_bytes(variant).map(|data| data.len() as f64) else {
             continue;
         };
-        let size_bytes = meta.len() as f64;
-        let line_count = FIXTURE_LINES as f64;
+        let line_count = measure::FIXTURE_LINES as f64;
 
-        let argv = vec!["cat".to_string(), fixture.to_string_lossy().into_owned()];
-        let c = match measure::collect(&argv, cfg.runs, cfg.warmup, Sink::Terminal) {
+        let c = match measure::collect_emit(variant, cfg.runs, cfg.warmup) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("tbench: render.throughput/{variant} failed: {e}; skipping");
@@ -259,13 +164,22 @@ fn run_render_throughput(
             eprintln!("tbench: render.throughput/{variant} produced no usable samples");
             continue;
         }
-        for (unit, samples) in [("MBps", &mbps), ("linesps", &linesps)] {
+        let raw_secs = c.raw_ms.iter().filter(|t| **t > 0.0).map(|t| t / 1000.0);
+        let raw_mbps: Vec<f64> = raw_secs
+            .clone()
+            .map(|s| (size_bytes / 1_000_000.0) / s)
+            .collect();
+        let raw_linesps: Vec<f64> = raw_secs.map(|s| line_count / s).collect();
+        for (unit, samples, raw) in [
+            ("MBps", &mbps, &raw_mbps),
+            ("linesps", &linesps, &raw_linesps),
+        ] {
             results.push(ResultRow {
                 metric: metric.clone(),
                 shell: None,
                 unit: unit.to_string(),
                 median: stats::median(samples),
-                p95: stats::p95(samples),
+                p95: stats::tail_p95(raw, stats::median(samples)),
                 stddev: stats::stddev(samples),
                 runs: c.samples_ms.len(),
                 outliers_removed: c.outliers_removed,
@@ -289,20 +203,7 @@ fn run_scroll_proxy(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<Resu
         .to_string();
     let unit = scenario.field("unit").unwrap_or("ms").to_string();
     let notes = scenario.field("notes").map(str::to_string);
-    if !gen_fixtures(&cfg.root) {
-        eprintln!("tbench: fixture generation failed, skipping scroll.proxy");
-        return false;
-    }
-    let fixture = cfg.root.join("fixtures/large-output-plain.txt");
-    if !fixture.exists() {
-        eprintln!(
-            "tbench: fixture {} missing, skipping scroll.proxy",
-            fixture.display()
-        );
-        return false;
-    }
-    let argv = vec!["cat".to_string(), fixture.to_string_lossy().into_owned()];
-    let c = match measure::collect(&argv, cfg.runs, cfg.warmup, Sink::Terminal) {
+    let c = match measure::collect_emit("plain", cfg.runs, cfg.warmup) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("tbench: scroll.proxy failed: {e}; skipping");
@@ -318,7 +219,7 @@ fn run_scroll_proxy(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<Resu
         shell: None,
         unit,
         median: stats::median(&c.samples_ms),
-        p95: stats::p95(&c.samples_ms),
+        p95: stats::tail_p95(&c.raw_ms, stats::median(&c.samples_ms)),
         stddev: stats::stddev(&c.samples_ms),
         runs: c.samples_ms.len(),
         outliers_removed: c.outliers_removed,
@@ -328,171 +229,6 @@ fn run_scroll_proxy(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<Resu
         samples: cfg.keep_samples.then(|| c.samples_ms.clone()),
     });
     true
-}
-
-// --- kind: input_latency -------------------------------------------------
-
-const BACKEND_PTY: &str = "rust-pty";
-
-/// One pty round trip: spawn `cat` on a fresh pty, write a byte to the
-/// master, time until it's echoed back. Mirrors the zpty measurement
-/// (fresh pty per trial); the reply wait is a poll(2) with a 1s budget so
-/// a stuck pty can't hang the run. Returns None if the pty layer itself
-/// failed (caller must skip the scenario).
-fn pty_round_trip_ms() -> Option<Option<f64>> {
-    let mut master_fd: libc::c_int = -1;
-    let mut slave_fd: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
-
-    let slave_stdio = |fd: &OwnedFd| unsafe { Stdio::from_raw_fd(libc::dup(fd.as_raw_fd())) };
-    let child = Command::new("cat")
-        .stdin(slave_stdio(&slave))
-        .stdout(slave_stdio(&slave))
-        .stderr(Stdio::null())
-        .spawn();
-    drop(slave);
-    let Ok(mut child) = child else { return None };
-
-    let start = Instant::now();
-    let wrote = unsafe { libc::write(master.as_raw_fd(), b"x".as_ptr().cast(), 1) } == 1;
-    let mut sample = None;
-    if wrote {
-        let mut pfd = libc::pollfd {
-            fd: master.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pfd, 1, 1000) };
-        if ready == 1 {
-            let mut buf = [0u8; 64];
-            let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                sample = Some(start.elapsed().as_secs_f64() * 1000.0);
-            }
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Some(sample)
-}
-
-fn run_input_latency(scenario: &Scenario, cfg: &RunConfig, results: &mut Vec<ResultRow>) -> bool {
-    let metric = scenario
-        .field("metric")
-        .unwrap_or("input.latency")
-        .to_string();
-    let unit = scenario.field("unit").unwrap_or("ms").to_string();
-    let notes_base = scenario.field("notes").map(str::to_string);
-
-    let runs = match cfg.runs {
-        Runs::Fixed(n) => n,
-        Runs::Auto => {
-            eprintln!("tbench: --runs auto is not supported for input.latency yet, using 20");
-            20
-        }
-    };
-
-    let mut produced = false;
-    for variant in ["idle", "loaded"] {
-        let mut flood = None;
-        if variant == "loaded" {
-            // Settle before the loaded variant so idle's pty teardown isn't
-            // still winding down when the flood starts.
-            settle(cfg);
-            let fixture = cfg.root.join("fixtures/large-output-plain.txt");
-            if !gen_fixtures(&cfg.root) {
-                eprintln!("tbench: input.latency/loaded requires a valid flood fixture, skipping");
-                continue;
-            }
-            match measure::flood_start(&fixture) {
-                Ok(f) => flood = Some(f),
-                Err(e) => {
-                    eprintln!(
-                        "tbench: input.latency/loaded could not start output flood: {e}; skipping"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        let mut samples_ms = Vec::new();
-        let mut trial_failed = false;
-        for _ in 0..cfg.warmup {
-            if !matches!(pty_round_trip_ms(), Some(Some(_))) {
-                trial_failed = true;
-                break;
-            }
-        }
-        for _ in 0..runs {
-            if trial_failed {
-                break;
-            }
-            match pty_round_trip_ms() {
-                Some(Some(ms)) => samples_ms.push(ms),
-                None | Some(None) => {
-                    trial_failed = true;
-                    break;
-                }
-            }
-        }
-
-        if let Some(f) = flood {
-            if let Err(e) = f.stop() {
-                eprintln!(
-                    "tbench: input.latency/{variant} output flood failed during sampling: {e}; discarding the variant"
-                );
-                continue;
-            }
-        }
-
-        if trial_failed {
-            eprintln!(
-                "tbench: input.latency/{variant} had a PTY setup, write, or echo timeout failure; discarding the variant"
-            );
-            continue;
-        }
-        if samples_ms.is_empty() {
-            eprintln!("tbench: input.latency/{variant} produced no usable samples");
-            continue;
-        }
-
-        let (outliers_removed, samples_ms) = stats::iqr_filter(&samples_ms);
-        if samples_ms.is_empty() {
-            eprintln!("tbench: input.latency/{variant} had no samples after filtering");
-            continue;
-        }
-        let med = stats::median(&samples_ms);
-
-        results.push(ResultRow {
-            metric: metric.clone(),
-            shell: None,
-            unit: unit.clone(),
-            median: med,
-            p95: stats::p95(&samples_ms),
-            stddev: stats::stddev(&samples_ms),
-            runs: samples_ms.len(),
-            outliers_removed,
-            backend: BACKEND_PTY.to_string(),
-            variant: Some(variant.to_string()),
-            notes: notes_base.clone(),
-            samples: cfg.keep_samples.then(|| samples_ms.clone()),
-        });
-        produced = true;
-    }
-    produced
 }
 
 // --- kind: fire ----------------------------------------------------------
@@ -612,17 +348,5 @@ mod tests {
         for invalid in ["0", "-1", "60.1", "NaN", "inf", "not-a-number"] {
             assert!(parse_fire_secs(Some(invalid)).is_err(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn incomplete_fixture_is_rejected() {
-        let path = std::env::temp_dir().join(format!(
-            "tbench-invalid-fixture-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        std::fs::write(&path, b"not the complete fixture\n").unwrap();
-        assert!(!fixture_is_valid(&path, LINE_TEXT, false).unwrap());
-        let _ = std::fs::remove_file(path);
     }
 }

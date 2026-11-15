@@ -1,5 +1,0 @@
-metric: input.latency
-kind: input_latency
-unit: ms
-description: "PTY round-trip: time from writing a byte into an openpty-spawned `cat` to reading the echoed byte back."
-notes: "Approximate: measures a pseudo-terminal echo round trip (which may be supplied by the PTY line discipline), not true keypress-to-screen-photon latency. Requires pty access; a setup, write, or echo-timeout failure invalidates the variant."

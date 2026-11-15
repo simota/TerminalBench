@@ -55,7 +55,7 @@
           "バージョン付きJSON性能レポート",
           "主張の境界に対する意味的検証",
           "ペアごとの適格性判定：COMPARABLE、NOT_COMPARABLE、UNDETERMINED",
-          "ベースライン比オーバービュー、中央値と方向考慮型competition rank（中央値が完全に同値なら同順位）を示すResults at a glance、指標別dot-and-intervalチャート、勝敗集計を備えた自己完結型HTML比較レポート",
+          "ベースライン比オーバービュー、中央値と方向考慮型competition rank（中央値が完全に同値なら同順位）を示すResults at a glance、指標別dot-and-intervalチャートを備えた自己完結型HTML比較レポート",
           "レポート履歴を横断する経時トレンドレポート"
         ]
       }
@@ -154,7 +154,7 @@ bin/tbench-validate validate results/report-b.json</code></pre>
             <li>
               <p class="step-number">04 / 比較</p>
               <h3>COMPARABLEの後にだけ値を提示する</h3>
-              <p>コンパレーターはMarkdownテーブル、または<code>--format html</code>で自己完結型のチャートレポート（<code>--baseline</code>で基準を選べるベースライン比オーバービュー、中央値と方向考慮型competition rankを示すResults at a glanceテーブル（中央値が完全に同値なら同順位）、指標別dot-and-intervalチャート（サンプルありではbootstrap 95% CI、なしでは中央値からp95までのwhisker）、勝敗集計）として値を提示します。検証や適格性判定の代わりにはなりません。</p>
+              <p>コンパレーターはMarkdownテーブル、または<code>--format html</code>で自己完結型のチャートレポート（<code>--baseline</code>で基準を選べるベースライン比オーバービュー、中央値と方向考慮型competition rankを示すResults at a glanceテーブル（中央値が完全に同値なら同順位）、指標別dot-and-intervalチャート（サンプルありではbootstrap 95% CI、なしでは中央値からp95までのwhisker））として値を提示します。検証や適格性判定の代わりにはなりません。</p>
               <pre><code>bin/tbench compare results/report-a.json results/report-b.json --format html</code></pre>
             </li>
           </ol>
@@ -311,11 +311,11 @@ bin/tbench compare results/report-a.json results/report-b.json</code></pre>
         <div class="faq-list">
           <details><summary>TerminalBenchは何を計測しますか？</summary><p>シェルプロセスの時間と、PTY出力、合成PTYエコー、プロセスリソースに対するターミナルエミュレーターのプロキシまたはサンプリング観測を記録します。v1の各指標には、手法、スコープ、観測境界、制約、対象外の主張が記載されます。</p></details>
           <details><summary>画面に表示される内容を計測しますか？</summary><p>いいえ。プロデューサー側のPTY完了では、ターミナル解析、最終フレーム提示、ピクセル、フレームスキップを観測しません。renderとscrollのプロファイルは画面上の主張を対象外とします。</p></details>
-          <details><summary>input.latencyは物理キー押下を計測しますか？</summary><p>いいえ。合成PTYエコーの往復を計測します。キーボード、GUIイベントルーティング、レンダリング、ディスプレイ提示、物理キー押下から表示までの遅延は対象外です。</p></details>
+          <details><summary>input.latencyは物理キー押下を計測しますか？</summary><p>いいえ。合成PTYエコーの往復を計測していましたが、このエコーはカーネルのPTY回線規約が返すものでターミナルエミュレーターを経由しないため、ランナーは現在この指標を出力しません。プロファイルは既存レポートのために登録されたままです。</p></details>
           <details><summary>どの2つのレポートでも比較できますか？</summary><p>いいえ。両方のレポートを検証してから、ペアごとの適格性ゲートを実行してください。COMPARABLEが返された後にだけ値を比較します。既知の不一致はNOT_COMPARABLE、決定的なコンテキストの不足はUNDETERMINEDを返します。</p></details>
           <details><summary>最速ターミナルのランキングですか？</summary><p>いいえ。このプロトコルは範囲を限定した観測を記録し、ペアごとの適格性を判定します。ランキングを運用したり、普遍的な勝者を認定したりはしません。</p></details>
           <details><summary>環境情報が不足している場合はどうなりますか？</summary><p>レポートは必須の事実を既知または不明として記録します。既知の不一致がすでにペアを拒否しておらず、決定的な事実が不明なままの場合、適格性はUNDETERMINEDです。プラットフォームから検出できない場合、CIから文書化された安定制御条件を提供できます。</p></details>
-          <details><summary>最初の実行には何が必要ですか？</summary><p>初回のみRustツールチェーン(cargo)で単一の自己完結バイナリをビルドします。以降のランタイム依存はありません。ターミナル向けシナリオには制御端末、input latencyには利用可能なPTYが必要です。</p></details>
+          <details><summary>最初の実行には何が必要ですか？</summary><p>初回のみRustツールチェーン(cargo)で単一の自己完結バイナリをビルドします。以降のランタイム依存はありません。ターミナル向けシナリオには制御端末が必要です。</p></details>
           <details><summary>Terminal-BenchというAIエージェント向けベンチマークですか？</summary><p>いいえ。このプロジェクトは、ターミナルエミュレーター性能のレポートと比較可能性のためのプロトコルです。</p></details>
         </div>
       </section>

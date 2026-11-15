@@ -20,10 +20,10 @@ debug: ## Debug build
 
 test: unit conformance ## All tests (Rust unit tests + Reporting Spec v1 suite)
 
-unit: ## Rust unit tests
-	$(CARGO) test
+unit: ## Rust unit and integration tests (TEST_ARGS="-- --nocapture" shows what the pty tests observed)
+	$(CARGO) test $(TEST_ARGS)
 
-conformance: build ## Reporting Spec v1 regression suite (tests/report-v1.sh, 14 checks)
+conformance: build ## Reporting Spec v1 regression suite (tests/report-v1.sh)
 	zsh tests/report-v1.sh
 
 lint: fmt-check clippy ## rustfmt --check + clippy (deny warnings)
@@ -43,9 +43,8 @@ check: lint test ## Everything CI would run: lint + all tests
 run: build ## Run the full benchmark suite (all scenarios, default shells)
 	./$(BIN) run
 
-clean: ## Remove build artifacts and generated fixtures (keeps results/)
+clean: ## Remove build artifacts (keeps results/)
 	$(CARGO) clean
-	rm -f fixtures/large-output-plain.txt fixtures/large-output-ansi.txt fixtures/large-output-cjk.txt
 
-install: ## Install the tbench binary via cargo install
+install: ## Install the tbench binary via cargo install (works from any directory)
 	$(CARGO) install --path .

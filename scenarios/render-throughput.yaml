@@ -1,4 +1,4 @@
 metric: render.throughput
 kind: render_throughput
-description: "Writes validated fixed fixtures to the controlling terminal; producer wall-clock completion -> MB/s and lines/s for plain, ANSI, and CJK variants."
+description: "Writes fixed in-memory fixtures to the controlling terminal; producer wall-clock completion -> MB/s and lines/s for plain, ANSI, and CJK variants."
 notes: "Measures producer-side PTY write completion, not confirmed on-screen rendering or shell performance."
