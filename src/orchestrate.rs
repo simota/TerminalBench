@@ -1,4 +1,4 @@
-//! `tbench orchestrate` — port of lib/orchestrate.sh. Sequentially
+//! `tbench orchestrate`. Sequentially
 //! launches a fresh window/instance of each requested terminal emulator,
 //! runs `tbench run` inside it, waits for completion, then compares the
 //! collected reports. Sequential by construction — the structural fix for

@@ -81,7 +81,7 @@ pub struct FireOutcome {
     pub region: (usize, usize), // cells actually rendered
 }
 
-fn winsize(fd: i32) -> (u16, u16) {
+pub(crate) fn winsize(fd: i32) -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
         (ws.ws_col, ws.ws_row)
@@ -167,6 +167,16 @@ impl Fire {
     }
 }
 
+/// Leaves the alternate screen and shows the cursor again when dropped.
+struct ScreenGuard(File);
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        let _ = self.0.write_all(crate::cleanup::RESTORE_SCREEN);
+        crate::cleanup::set_alt_screen(false);
+    }
+}
+
 /// Run the fire workload for `secs` wall-clock seconds against the given
 /// output (a real tty for genuine numbers; anything Write otherwise).
 /// `full` uses the live window size (capped) instead of the fixed 80x24.
@@ -181,7 +191,10 @@ pub fn run(secs: f64, out: &mut File, full: bool) -> std::io::Result<FireOutcome
 
     let mut fire = Fire::new(w, rows);
 
-    // alt screen + hidden cursor + clear; restored on exit
+    // alt screen + hidden cursor + clear. The guard puts the screen back
+    // on every way out of this function, including a failed write.
+    crate::cleanup::set_alt_screen(true);
+    let _screen = ScreenGuard(out.try_clone()?);
     out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J")?;
 
     // Warmup stays serial (nothing is timed yet; bytes are identical).
@@ -244,8 +257,6 @@ pub fn run(secs: f64, out: &mut File, full: bool) -> std::io::Result<FireOutcome
     drop(frame_tx);
     let (frames, t_last_ns, error) = writer.join().unwrap_or((0, 0, true));
 
-    let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
-
     if error {
         return Err(std::io::Error::other("fire: write failed"));
     }
@@ -288,6 +299,24 @@ mod tests {
         let n = a.len().min(b.len()) - EXIT_SEQ_LEN;
         assert!(n > 1000);
         assert_eq!(&a[..n], &b[..n], "first divergence inside the frame stream");
+    }
+
+    /// The guard is what restores the screen on an early return, so it
+    /// has to write the full restore sequence when dropped.
+    #[test]
+    fn screen_guard_writes_the_restore_sequence_on_drop() {
+        let p = std::env::temp_dir().join(format!("tbench-fire-guard-{}", std::process::id()));
+        drop(ScreenGuard(File::create(&p).unwrap()));
+        assert_eq!(std::fs::read(&p).unwrap(), crate::cleanup::RESTORE_SCREEN);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// A failing terminal write ends the run with an error, not a hang.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_write_is_an_error() {
+        let mut full = File::options().write(true).open("/dev/full").unwrap();
+        assert!(run(0.05, &mut full, false).is_err());
     }
 
     /// Byte parity against the vendored C tool (`tools/fire.c`, retired):

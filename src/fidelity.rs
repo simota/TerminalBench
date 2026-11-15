@@ -1,4 +1,4 @@
-//! DECSET 2026 (synchronized output) probe — port of lib/fidelity.sh.
+//! DECSET 2026 (synchronized output) probe.
 //! Writes DECRQM (`CSI ? 2026 $ p`) to /dev/tty in raw mode and reads the
 //! terminal's automatic reply (`CSI ? 2026 ; Ps $ y`). Not a frame-skip
 //! detector: it only reports whether the terminal recognizes mode 2026.
@@ -43,7 +43,9 @@ fn probe_impl() -> Option<&'static str> {
     unsafe { libc::cfmakeraw(&mut raw) };
     raw.c_cc[libc::VMIN] = 0;
     raw.c_cc[libc::VTIME] = 10;
+    crate::cleanup::save_termios(&saved);
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        crate::cleanup::clear_termios();
         return None;
     }
 
@@ -78,5 +80,6 @@ fn probe_impl() -> Option<&'static str> {
     })();
 
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+    crate::cleanup::clear_termios();
     verdict
 }

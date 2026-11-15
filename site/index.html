@@ -55,7 +55,7 @@
           "Versioned JSON performance reports",
           "Semantic claim-boundary validation",
           "Pairwise eligibility outcomes: COMPARABLE, NOT_COMPARABLE, and UNDETERMINED",
-          "Self-contained HTML comparison reports with a baseline-relative overview, Results at a glance medians and direction-aware competition ranks (exact ties share a rank), per-metric dot-and-interval charts, and a win tally",
+          "Self-contained HTML comparison reports with a baseline-relative overview, Results at a glance medians and direction-aware competition ranks (exact ties share a rank), and per-metric dot-and-interval charts",
           "Longitudinal trend reports across report history"
         ]
       }
@@ -154,7 +154,7 @@ bin/tbench-validate validate results/report-b.json</code></pre>
             <li>
               <p class="step-number">04 / Compare</p>
               <h3>Present values only after COMPARABLE</h3>
-              <p>The comparator presents the values as a Markdown table or, with <code>--format html</code>, a self-contained chart report: a baseline-relative overview (<code>--baseline</code> picks the reference), a Results at a glance table of medians and direction-aware competition ranks (exact ties share a rank), per-metric dot-and-interval charts (bootstrap 95% CI with samples; median-to-p95 whisker otherwise), and a win tally. It does not replace validation or the eligibility decision.</p>
+              <p>The comparator presents the values as a Markdown table or, with <code>--format html</code>, a self-contained chart report: a baseline-relative overview (<code>--baseline</code> picks the reference), a Results at a glance table of medians and direction-aware competition ranks (exact ties share a rank), and per-metric dot-and-interval charts (bootstrap 95% CI with samples; median-to-p95 whisker otherwise). It does not replace validation or the eligibility decision.</p>
               <pre><code>bin/tbench compare results/report-a.json results/report-b.json --format html</code></pre>
             </li>
           </ol>
@@ -311,11 +311,11 @@ bin/tbench compare results/report-a.json results/report-b.json</code></pre>
         <div class="faq-list">
           <details><summary>What does TerminalBench measure?</summary><p>It records shell process timings and terminal-emulator proxy or sampled observations for PTY output, synthetic PTY echo, and process resources. Every v1 metric names its method, scope, observed boundary, limitations, and excluded claims.</p></details>
           <details><summary>Does it measure what appears on screen?</summary><p>No. Producer-side PTY completion does not observe terminal parsing, final-frame presentation, pixels, or frame skipping. The render and scroll profiles exclude on-screen claims.</p></details>
-          <details><summary>Does input.latency measure a physical keypress?</summary><p>No. It measures a synthetic PTY echo round trip. It excludes the keyboard, GUI event routing, rendering, display presentation, and physical keypress-to-photon latency.</p></details>
+          <details><summary>Does input.latency measure a physical keypress?</summary><p>No. It measured a synthetic PTY echo round trip. That echo comes from the kernel's PTY line discipline and never passes through the terminal emulator, so the runner no longer emits it. The profile stays registered for existing reports.</p></details>
           <details><summary>Can I compare any two reports?</summary><p>No. Validate both reports, then run the pairwise eligibility gate. Compare values only after it returns COMPARABLE. A known mismatch returns NOT_COMPARABLE; missing decisive context returns UNDETERMINED.</p></details>
           <details><summary>Is this a fastest-terminal ranking?</summary><p>No. The protocol records bounded observations and decides pairwise eligibility. It does not operate a leaderboard or certify a universal winner.</p></details>
           <details><summary>What happens when the environment is incomplete?</summary><p>Reports record required facts as known or unknown. If a decisive fact remains unknown and no known mismatch already blocks the pair, eligibility is UNDETERMINED. CI can provide documented stable controls when platform discovery cannot.</p></details>
-          <details><summary>What does the first run require?</summary><p>A Rust toolchain (cargo), used once to build the single self-contained binary — after that there are no runtime dependencies. Terminal-facing scenarios need a controlling terminal, and input latency needs a usable PTY.</p></details>
+          <details><summary>What does the first run require?</summary><p>A Rust toolchain (cargo), used once to build the single self-contained binary — after that there are no runtime dependencies. Terminal-facing scenarios need a controlling terminal.</p></details>
           <details><summary>Is this the AI-agent benchmark named Terminal-Bench?</summary><p>No. This project is a terminal-emulator performance reporting and comparability protocol.</p></details>
         </div>
       </section>
